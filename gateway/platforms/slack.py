@@ -973,23 +973,25 @@ class SlackAdapter(BasePlatformAdapter):
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
 
         if not is_dm and bot_uid and not is_mentioned:
-            reply_to_bot_thread = (
-                is_thread_reply and event_thread_ts in self._bot_message_ts
-            )
-            in_mentioned_thread = (
-                event_thread_ts is not None
-                and event_thread_ts in self._mentioned_threads
-            )
-            has_session = (
-                is_thread_reply
-                and self._has_active_session_for_thread(
-                    channel_id=channel_id,
-                    thread_ts=event_thread_ts,
-                    user_id=user_id,
+            # Allow bypassing mention-gate if configured (e.g., via gateway.slack.listen_all_messages)
+            if not self.config.extra.get("listen_all_messages", False):
+                reply_to_bot_thread = (
+                    is_thread_reply and event_thread_ts in self._bot_message_ts
                 )
-            )
-            if not reply_to_bot_thread and not in_mentioned_thread and not has_session:
-                return
+                in_mentioned_thread = (
+                    event_thread_ts is not None
+                    and event_thread_ts in self._mentioned_threads
+                )
+                has_session = (
+                    is_thread_reply
+                    and self._has_active_session_for_thread(
+                        channel_id=channel_id,
+                        thread_ts=event_thread_ts,
+                        user_id=user_id,
+                    )
+                )
+                if not reply_to_bot_thread and not in_mentioned_thread and not has_session:
+                    return
 
         if is_mentioned:
             # Strip the bot mention from the text
