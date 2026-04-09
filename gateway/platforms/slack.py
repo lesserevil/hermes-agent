@@ -571,6 +571,24 @@ class SlackAdapter(BasePlatformAdapter):
             self._user_name_cache[user_id] = user_id
             return user_id
 
+    _MENTION_RE = re.compile(r'<@([UW][A-Z0-9]+)(?:\|[^>]*)?>')
+
+    async def _resolve_mentions_in_text(self, text: str, chat_id: str = "") -> str:
+        """Replace <@UXXXXX> Slack mention tokens with @display_name.
+
+        Resolves all user/bot mentions in a message so the LLM sees
+        human-readable names rather than opaque Slack IDs.  Uses the
+        existing _resolve_user_name cache so repeated mentions are free.
+        """
+        uids = set(self._MENTION_RE.findall(text))
+        for uid in uids:
+            name = await self._resolve_user_name(uid, chat_id=chat_id)
+            text = self._MENTION_RE.sub(
+                lambda m, uid=uid, name=name: f"@{name}" if m.group(1) == uid else m.group(0),
+                text,
+            )
+        return text
+
     async def send_image_file(
         self,
         chat_id: str,
@@ -1004,6 +1022,10 @@ class SlackAdapter(BasePlatformAdapter):
                     for t in to_remove:
                         self._mentioned_threads.discard(t)
 
+        # Resolve any remaining <@UXXXXX> mention tokens to display names so
+        # the LLM sees "@Race Bannon" instead of "<@U04ABC123>".
+        text = await self._resolve_mentions_in_text(text, chat_id=channel_id)
+
         # When entering a thread for the first time (no existing session),
         # fetch thread context so the agent understands the conversation.
         if is_thread_reply and not self._has_active_session_for_thread(
@@ -1352,8 +1374,9 @@ class SlackAdapter(BasePlatformAdapter):
                 is_parent = msg_ts == thread_ts
                 prefix = "[thread parent] " if is_parent else ""
 
-                # Resolve user name (cached)
+                # Resolve user name and any @mention tokens in the message
                 name = await self._resolve_user_name(msg_user, chat_id=channel_id)
+                msg_text = await self._resolve_mentions_in_text(msg_text, chat_id=channel_id)
                 context_parts.append(f"{prefix}{name}: {msg_text}")
 
             if not context_parts:
