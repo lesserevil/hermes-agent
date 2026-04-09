@@ -991,25 +991,27 @@ class SlackAdapter(BasePlatformAdapter):
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
 
         if not is_dm and bot_uid and not is_mentioned:
-            # Allow bypassing mention-gate if configured (e.g., via gateway.slack.listen_all_messages)
-            if not self.config.extra.get("listen_all_messages", False):
-                reply_to_bot_thread = (
-                    is_thread_reply and event_thread_ts in self._bot_message_ts
+            # Apply thread/session heuristics regardless of listen_all_messages.
+            # listen_all_messages=true means we *receive* all Slack events from the
+            # socket connection, but does NOT mean we invoke the LLM for every
+            # message — we still require a direct @mention or active thread context.
+            reply_to_bot_thread = (
+                is_thread_reply and event_thread_ts in self._bot_message_ts
+            )
+            in_mentioned_thread = (
+                event_thread_ts is not None
+                and event_thread_ts in self._mentioned_threads
+            )
+            has_session = (
+                is_thread_reply
+                and self._has_active_session_for_thread(
+                    channel_id=channel_id,
+                    thread_ts=event_thread_ts,
+                    user_id=user_id,
                 )
-                in_mentioned_thread = (
-                    event_thread_ts is not None
-                    and event_thread_ts in self._mentioned_threads
-                )
-                has_session = (
-                    is_thread_reply
-                    and self._has_active_session_for_thread(
-                        channel_id=channel_id,
-                        thread_ts=event_thread_ts,
-                        user_id=user_id,
-                    )
-                )
-                if not reply_to_bot_thread and not in_mentioned_thread and not has_session:
-                    return
+            )
+            if not reply_to_bot_thread and not in_mentioned_thread and not has_session:
+                return
 
         if is_mentioned:
             # Strip the bot mention from the text
