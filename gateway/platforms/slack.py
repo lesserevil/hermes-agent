@@ -810,7 +810,9 @@ class SlackAdapter(BasePlatformAdapter):
         #   3. The message is in a thread where the bot was previously @mentioned, OR
         #   4. There's an existing session for this thread (survives restarts)
         bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
-        is_mentioned = bot_uid and f"<@{bot_uid}>" in text
+        is_mentioned = bool(bot_uid and f"<@{bot_uid}>" in text)
+        if not is_mentioned and self.config.extra.get("respond_to_broadcasts", False):
+            is_mentioned = "<!here>" in text or "<!channel>" in text
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
 
