@@ -807,7 +807,6 @@ class SlackAdapter(BasePlatformAdapter):
         thread_ts = (
             assistant_thread.get("thread_ts")
             or event.get("thread_ts")
-            or event.get("message_ts")
             or ""
         )
         user_id = (
@@ -976,7 +975,10 @@ class SlackAdapter(BasePlatformAdapter):
         if is_dm:
             thread_ts = event.get("thread_ts") or assistant_meta.get("thread_ts")  # None for top-level DMs
         else:
-            thread_ts = event.get("thread_ts") or ts  # ts fallback for channels
+            if not self.config.extra.get("reply_in_thread", True):
+                thread_ts = event.get("thread_ts") or ""  # No synthetic thread for top-level messages
+            else:
+                thread_ts = event.get("thread_ts") or ts  # ts fallback for channels
 
         # In channels, respond if:
         #   1. The bot is @mentioned in this message, OR
@@ -990,7 +992,13 @@ class SlackAdapter(BasePlatformAdapter):
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
 
-        if not is_dm and bot_uid and not is_mentioned:
+        # free_response_channels: comma-separated channel IDs (or "ALL")
+        # where the bot responds without requiring an @mention.
+        free_channels_raw = self.config.extra.get("free_response_channels", "")
+        free_channels = {ch.strip() for ch in free_channels_raw.split(",") if ch.strip()}
+        is_free_channel = "ALL" in free_channels or channel_id in free_channels
+
+        if not is_dm and bot_uid and not is_mentioned and not is_free_channel:
             # Apply thread/session heuristics regardless of listen_all_messages.
             # listen_all_messages=true means we *receive* all Slack events from the
             # socket connection, but does NOT mean we invoke the LLM for every
