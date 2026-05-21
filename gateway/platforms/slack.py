@@ -101,6 +101,38 @@ class SlackAdapter(BasePlatformAdapter):
         # session + memory scoping.
         self._assistant_threads: Dict[Tuple[str, str], Dict[str, str]] = {}
         self._ASSISTANT_THREADS_MAX = 5000
+        # Cache for parsed hermes: metadata from channel topics
+        self._channel_metadata_cache: Dict[str, Dict[str, str]] = {}
+
+    async def _fetch_channel_metadata(self, channel_id: str) -> Dict[str, str]:
+        """Fetch channel topic via conversations.info and parse hermes: metadata.
+
+        Returns a dict of key=value pairs found after a `hermes:` prefix in
+        the channel topic.  Results are cached per channel_id.
+        """
+        if channel_id in self._channel_metadata_cache:
+            return self._channel_metadata_cache[channel_id]
+
+        metadata: Dict[str, str] = {}
+        try:
+            client = self._get_client(channel_id)
+            result = await client.conversations_info(channel=channel_id)
+            topic = result.get("channel", {}).get("topic", {}).get("value", "")
+            if topic:
+                for line in topic.splitlines():
+                    line = line.strip()
+                    if line.startswith("hermes:"):
+                        rest = line[len("hermes:"):].strip()
+                        for part in rest.split():
+                            if "=" in part:
+                                k, v = part.split("=", 1)
+                                metadata[k] = v
+                        break
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug("[Slack] Failed to fetch channel topic for %s: %s", channel_id, e)
+
+        self._channel_metadata_cache[channel_id] = metadata
+        return metadata
 
     async def connect(self) -> bool:
         """Connect to Slack via Socket Mode."""
@@ -1036,6 +1068,12 @@ class SlackAdapter(BasePlatformAdapter):
         # the LLM sees "@Race Bannon" instead of "<@U04ABC123>".
         text = await self._resolve_mentions_in_text(text, chat_id=channel_id)
 
+        # Fetch channel metadata from topic (hermes: repo=...)
+        channel_metadata = await self._fetch_channel_metadata(channel_id)
+        chat_topic = None
+        if channel_metadata:
+            chat_topic = " ".join(f"{k}={v}" for k, v in channel_metadata.items())
+
         # When entering a thread for the first time (no existing session),
         # fetch thread context so the agent understands the conversation.
         if is_thread_reply and not self._has_active_session_for_thread(
@@ -1151,6 +1189,7 @@ class SlackAdapter(BasePlatformAdapter):
             user_id=user_id,
             user_name=user_name,
             thread_id=thread_ts,
+            chat_topic=chat_topic,
         )
 
         msg_event = MessageEvent(
