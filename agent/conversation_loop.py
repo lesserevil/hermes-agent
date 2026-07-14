@@ -4277,6 +4277,63 @@ def run_conversation(
                         if repaired:
                             print(f"{agent.log_prefix}🔧 Auto-repaired tool name: '{tc.function.name}' -> '{repaired}'")
                             tc.function.name = repaired
+
+                # Deferred MCP tools are intentionally absent from the
+                # model-facing function list.  If a model invents a MaaS name,
+                # do not execute a fuzzy match and do not strand the turn on a
+                # generic "tool does not exist" error.  Convert the call into
+                # a scoped catalog search so the next model step sees valid
+                # names and can describe the selected schema before invoking
+                # it. Exact deferred names are handled by the bridge rewrite
+                # installed below this block.
+                try:
+                    from agent.tool_executor import _tool_search_scoped_names
+                    from tools import tool_search as _ts
+
+                    scoped_deferred_names = _tool_search_scoped_names(agent)
+                    for tc in assistant_message.tool_calls:
+                        invented_name = tc.function.name
+                        if (
+                            invented_name.startswith("mcp_maas_")
+                            and invented_name not in scoped_deferred_names
+                            and _ts.TOOL_SEARCH_NAME in agent.valid_tool_names
+                        ):
+                            tc.function.name = _ts.TOOL_SEARCH_NAME
+                            tc.function.arguments = json.dumps({
+                                "query": invented_name,
+                                "limit": 10,
+                            })
+                except Exception:
+                    pass
+
+                # Some local models emit a deferred tool's discovered name as
+                # a direct function call instead of invoking the visible
+                # ``tool_call`` bridge. Preserve progressive disclosure while
+                # accepting that equivalent form: only rewrite names in this
+                # session's scoped deferrable catalog, then let the normal
+                # bridge unwrap enforce scope, middleware, and guardrails.
+                try:
+                    from agent.tool_executor import _tool_search_scoped_names
+                    from tools import tool_search as _ts
+
+                    scoped_deferred_names = _tool_search_scoped_names(agent)
+                    for tc in assistant_message.tool_calls:
+                        deferred_name = tc.function.name
+                        if (
+                            deferred_name not in agent.valid_tool_names
+                            and deferred_name in scoped_deferred_names
+                        ):
+                            try:
+                                deferred_args = json.loads(tc.function.arguments or "{}")
+                            except (TypeError, json.JSONDecodeError):
+                                deferred_args = {}
+                            tc.function.name = _ts.TOOL_CALL_NAME
+                            tc.function.arguments = json.dumps({
+                                "name": deferred_name,
+                                "arguments": deferred_args if isinstance(deferred_args, dict) else {},
+                            })
+                except Exception:
+                    pass
                 invalid_tool_calls = [
                     tc.function.name for tc in assistant_message.tool_calls
                     if tc.function.name not in agent.valid_tool_names

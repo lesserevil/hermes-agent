@@ -10,6 +10,8 @@ reasoning configuration, temperature handling, and extra_body assembly.
 """
 
 import copy
+import json
+import re
 from typing import Any, Dict
 
 from agent.lmstudio_reasoning import resolve_lmstudio_effort
@@ -17,6 +19,13 @@ from agent.moonshot_schema import is_moonshot_model, sanitize_moonshot_tools
 from agent.prompt_builder import DEVELOPER_ROLE_MODELS
 from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall, Usage
+
+
+_TEXTUAL_DEFERRED_TOOL_CALL = re.compile(
+    r"^\s*<tool_call_result>\s*<tool_name>(mcp_maas_[A-Za-z0-9_]+)</tool_name>"
+    r"\s*<arguments>(\{.*\})</arguments>\s*</tool_call_result>\s*$",
+    flags=re.DOTALL,
+)
 
 
 def _build_gemini_thinking_config(model: str, reasoning_config: dict | None) -> dict | None:
@@ -636,6 +645,28 @@ class ChatCompletionsTransport(ProviderTransport):
                     )
                 )
 
+        # A few OpenAI-compatible local models occasionally serialize a tool
+        # call as visible XML-like text instead of returning native
+        # ``tool_calls``. Accept only the exact, whole-response MaaS envelope;
+        # the conversation loop still validates that the deferred name is in
+        # this session's scoped catalog before the normal bridge executes it.
+        textual_deferred_call = False
+        if not tool_calls and isinstance(msg.content, str):
+            match = _TEXTUAL_DEFERRED_TOOL_CALL.fullmatch(msg.content)
+            if match:
+                try:
+                    textual_arguments = json.loads(match.group(2))
+                except (TypeError, json.JSONDecodeError):
+                    textual_arguments = None
+                if isinstance(textual_arguments, dict):
+                    tool_calls = [ToolCall(
+                        id="call_textual_deferred_0",
+                        name=match.group(1),
+                        arguments=json.dumps(textual_arguments),
+                    )]
+                    finish_reason = "tool_calls"
+                    textual_deferred_call = True
+
         usage = None
         if hasattr(response, "usage") and response.usage:
             u = response.usage
@@ -674,7 +705,7 @@ class ChatCompletionsTransport(ProviderTransport):
         # Promote it to content + a ``content_filter`` finish reason so the
         # loop's refusal handler surfaces it clearly and stops. ``refusal`` is
         # ``None`` for normal responses, so this is a no-op in the common case.
-        content = msg.content
+        content = "" if textual_deferred_call else msg.content
         refusal = getattr(msg, "refusal", None)
         if refusal is None and hasattr(msg, "model_extra"):
             _msg_extra = getattr(msg, "model_extra", None) or {}
