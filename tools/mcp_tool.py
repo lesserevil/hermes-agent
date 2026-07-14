@@ -3192,6 +3192,122 @@ _server_breaker_opened_at: Dict[str, float] = {}
 _CIRCUIT_BREAKER_THRESHOLD = 3
 _CIRCUIT_BREAKER_COOLDOWN_SEC = 60.0
 
+# Shared per-server throttling state. MCP handlers run on caller threads, so a
+# cooldown learned by one scheduled job must also slow concurrent jobs using
+# the same connector. This is deliberately separate from the connectivity
+# circuit breaker: a 429 proves the server is reachable and must not count as
+# a transport failure.
+_server_rate_limit_until: Dict[str, float] = {}
+_server_rate_limit_lock = threading.Lock()
+_RATE_LIMIT_MAX_ATTEMPTS = 3
+_RATE_LIMIT_BASE_DELAY_SEC = 2.0
+_RATE_LIMIT_MAX_DELAY_SEC = 30.0
+_RECONNECT_WAIT_SEC = 5.0
+_RECONNECT_POLL_SEC = 0.1
+
+
+def _rate_limit_text(value: Any) -> str:
+    """Return the error-like text used to classify an MCP result/exception."""
+    if isinstance(value, BaseException):
+        return _exc_str(value)
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return value
+        if isinstance(parsed, dict) and "error" in parsed:
+            return str(parsed.get("error") or "")
+    return ""
+
+
+def _is_rate_limited(value: Any) -> bool:
+    text = _rate_limit_text(value).lower()
+    return bool(text) and (
+        "429" in text
+        or "rate limit" in text
+        or "ratelimit" in text
+        or "too many requests" in text
+        or "throttl" in text
+    )
+
+
+def _rate_limit_delay(value: Any, attempt: int) -> float:
+    """Honor a Retry-After hint when present, else use bounded backoff."""
+    text = _rate_limit_text(value)
+    match = re.search(
+        r"retry[-_ ]?after(?:\s*(?:seconds?|secs?))?\s*[:=]?\s*(\d+(?:\.\d+)?)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return min(_RATE_LIMIT_MAX_DELAY_SEC, max(0.25, float(match.group(1))))
+    return min(
+        _RATE_LIMIT_MAX_DELAY_SEC,
+        _RATE_LIMIT_BASE_DELAY_SEC * (2 ** max(0, attempt - 1)),
+    )
+
+
+def _arm_server_rate_limit(server_name: str, delay: float) -> None:
+    with _server_rate_limit_lock:
+        _server_rate_limit_until[server_name] = max(
+            _server_rate_limit_until.get(server_name, 0.0),
+            time.monotonic() + delay,
+        )
+
+
+def _wait_for_server_rate_limit(server_name: str) -> None:
+    with _server_rate_limit_lock:
+        delay = max(
+            0.0,
+            _server_rate_limit_until.get(server_name, 0.0) - time.monotonic(),
+        )
+    if delay:
+        time.sleep(delay)
+
+
+def _wait_for_server_session(server: Any, timeout: float = _RECONNECT_WAIT_SEC) -> bool:
+    """Wait briefly for a reconnect signal to produce a live session."""
+    deadline = time.monotonic() + max(0.0, timeout)
+    while time.monotonic() < deadline:
+        if getattr(server, "session", None):
+            return True
+        time.sleep(_RECONNECT_POLL_SEC)
+    return bool(getattr(server, "session", None))
+
+
+def _validate_mcp_arguments(args: Any, input_schema: Optional[dict]) -> Optional[dict]:
+    """Perform cheap schema checks before spending a remote MCP request."""
+    if not isinstance(args, dict):
+        return {
+            "error": "MCP tool arguments must be a JSON object.",
+            "error_code": "invalid_arguments",
+        }
+    schema = input_schema or {}
+    required = schema.get("required") or []
+    missing = [name for name in required if name not in args or args[name] is None]
+    if missing:
+        return {
+            "error": (
+                "Missing required MCP argument(s): " + ", ".join(missing)
+                + ". Use tool_describe and retry with the documented schema."
+            ),
+            "error_code": "invalid_arguments",
+            "missing_required": missing,
+        }
+    properties = schema.get("properties") or {}
+    if schema.get("additionalProperties") is False:
+        unexpected = sorted(set(args) - set(properties))
+        if unexpected:
+            return {
+                "error": (
+                    "Unexpected MCP argument(s): " + ", ".join(unexpected)
+                    + ". Use tool_describe and retry with the documented schema."
+                ),
+                "error_code": "invalid_arguments",
+                "unexpected": unexpected,
+            }
+    return None
+
 
 def _bump_server_error(server_name: str) -> None:
     """Increment the consecutive-failure count for ``server_name``.
@@ -4096,7 +4212,12 @@ def _mark_server_call_started(server: Any) -> None:
         mark_tool_call()
 
 
-def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
+def _make_tool_handler(
+    server_name: str,
+    tool_name: str,
+    tool_timeout: float,
+    input_schema: Optional[dict] = None,
+):
     """Return a sync handler that calls an MCP tool via the background loop.
 
     The handler conforms to the registry's dispatch interface:
@@ -4104,6 +4225,10 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """
 
     def _handler(args: dict, **kwargs) -> str:
+        validation_error = _validate_mcp_arguments(args, input_schema)
+        if validation_error:
+            return json.dumps(validation_error, ensure_ascii=False)
+
         # Circuit breaker: if this server has failed too many times
         # consecutively, short-circuit with a clear message so the model
         # stops retrying and uses alternative approaches (#10447).
@@ -4158,18 +4283,25 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 # without burning iterations. The breaker resets once the
                 # fresh session initializes (_run_stdio/_run_http call
                 # _reset_server_error).
-                _bump_server_error(server_name)
                 if _signal_reconnect(server):
+                    if _wait_for_server_session_ready(
+                        server, timeout=min(5.0, float(tool_timeout or 5.0)),
+                    ):
+                        _reset_server_error(server_name)
+                    else:
+                        _bump_server_error(server_name)
+                        return json.dumps({
+                            "error": (
+                                f"MCP server '{server_name}' transport is down; "
+                                f"reconnect requested. Do NOT retry this tool "
+                                f"immediately — give it a few seconds to come back."
+                            )
+                        }, ensure_ascii=False)
+                else:
+                    _bump_server_error(server_name)
                     return json.dumps({
-                        "error": (
-                            f"MCP server '{server_name}' transport is down; "
-                            f"reconnect requested. Do NOT retry this tool "
-                            f"immediately — give it a few seconds to come back."
-                        )
+                        "error": f"MCP server '{server_name}' is not connected"
                     }, ensure_ascii=False)
-                return json.dumps({
-                    "error": f"MCP server '{server_name}' is not connected"
-                }, ensure_ascii=False)
 
         async def _call():
             _mark_server_call_started(server)
@@ -4269,12 +4401,51 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             return _run_on_mcp_loop(_call, timeout=tool_timeout)
 
         try:
-            result = _call_once()
+            result = None
+            for attempt in range(1, _RATE_LIMIT_MAX_ATTEMPTS + 1):
+                _wait_for_server_rate_limit(server_name)
+                try:
+                    result = _call_once()
+                except Exception as exc:
+                    if not _is_rate_limited(exc):
+                        raise
+                    result = exc
+
+                if not _is_rate_limited(result):
+                    break
+                if attempt >= _RATE_LIMIT_MAX_ATTEMPTS:
+                    retry_after = _rate_limit_delay(result, attempt)
+                    _arm_server_rate_limit(server_name, retry_after)
+                    return json.dumps({
+                        "error": (
+                            f"MCP server '{server_name}' is rate limited after "
+                            f"{attempt} attempts. Retry after about {retry_after:g} seconds."
+                        ),
+                        "error_code": "rate_limited",
+                        "retry_after_seconds": retry_after,
+                    }, ensure_ascii=False)
+
+                delay = _rate_limit_delay(result, attempt)
+                _arm_server_rate_limit(server_name, delay)
+                logger.warning(
+                    "MCP server %s rate limited calling %s; retrying in %.1fs (%d/%d)",
+                    server_name, tool_name, delay, attempt + 1, _RATE_LIMIT_MAX_ATTEMPTS,
+                )
+
+            assert isinstance(result, str)
             # Check if the MCP tool itself returned an error
             try:
                 parsed = json.loads(result)
                 if "error" in parsed:
-                    _bump_server_error(server_name)
+                    # Argument/auth/application failures are not evidence that
+                    # the transport is unreachable. Keep the connectivity
+                    # breaker reserved for actual transport failures.
+                    error_text = str(parsed.get("error") or "").lower()
+                    if any(token in error_text for token in (
+                        "not connected", "transport is down", "connection",
+                        "unreachable", "timed out", "timeout",
+                    )):
+                        _bump_server_error(server_name)
                 else:
                     _reset_server_error(server_name)  # success — reset
             except (json.JSONDecodeError, TypeError):
@@ -5077,7 +5248,12 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             name=tool_name_prefixed,
             toolset=toolset_name,
             schema=schema,
-            handler=_make_tool_handler(name, mcp_tool.name, server.tool_timeout),
+            handler=_make_tool_handler(
+                name,
+                mcp_tool.name,
+                server.tool_timeout,
+                getattr(mcp_tool, "inputSchema", None),
+            ),
             check_fn=_make_check_fn(name),
             is_async=False,
             description=schema["description"],

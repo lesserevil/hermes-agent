@@ -134,8 +134,42 @@ def _make_hermes_provider_class() -> Optional[type]:
             *args: Any,
             server_name: str = "",
             preregistered: bool = False,
+            configured_scope: str = "",
             **kwargs: Any,
         ):
+            self._hermes_configured_scope = configured_scope.strip()
+            if self._hermes_configured_scope and kwargs.get("redirect_handler"):
+                original_redirect_handler = kwargs["redirect_handler"]
+
+                async def scoped_redirect_handler(authorization_url: str) -> None:
+                    """Keep an explicit least-privilege scope after SDK discovery.
+
+                    MCP SDK scope selection replaces the configured client scope with every
+                    scope advertised by protected-resource metadata. That is unsafe for servers
+                    such as Slack whose metadata advertises both read and write capabilities.
+                    An explicit Hermes scope is an upper bound, not a hint.
+                    """
+                    from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+                    parsed = urlsplit(authorization_url)
+                    query = [
+                        (key, value)
+                        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+                        if key != "scope"
+                    ]
+                    query.append(("scope", self._hermes_configured_scope))
+                    narrowed_url = urlunsplit((
+                        parsed.scheme,
+                        parsed.netloc,
+                        parsed.path,
+                        urlencode(query),
+                        parsed.fragment,
+                    ))
+                    # Token-response scope validation uses this same metadata object.
+                    self.context.client_metadata.scope = self._hermes_configured_scope
+                    await original_redirect_handler(narrowed_url)
+
+                kwargs["redirect_handler"] = scoped_redirect_handler
             super().__init__(*args, **kwargs)
             self._hermes_server_name = server_name
             self._hermes_home = ""
@@ -574,6 +608,7 @@ class MCPOAuthManager:
         return _HERMES_PROVIDER_CLS(
             server_name=server_name,
             preregistered=bool(cfg.get("client_id")),
+            configured_scope=str(cfg.get("scope") or ""),
             server_url=entry.server_url,
             client_metadata=client_metadata,
             storage=storage,

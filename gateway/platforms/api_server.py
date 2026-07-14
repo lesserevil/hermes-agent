@@ -94,6 +94,73 @@ from gateway.readiness import collect_runtime_readiness
 
 logger = logging.getLogger(__name__)
 
+_STEER_OPEN = "[OUT-OF-BAND USER MESSAGE"
+_STEER_CLOSE = "[/OUT-OF-BAND USER MESSAGE]"
+_STEER_BLOCK_RE = re.compile(
+    r"\s*\[OUT-OF-BAND USER MESSAGE[^\]]*\]\s*"
+    r"<their message>\s*(.*?)\s*"
+    r"\[/OUT-OF-BAND USER MESSAGE\]\s*",
+    flags=re.DOTALL,
+)
+_STOP_STEER_RE = re.compile(
+    r"^(?:linus,?\s+)?(?:"
+    r"(?:(?:can|could|would)\s+you\s+)?(?:please\s+)?stop"
+    r"(?:\s+(?:talking|speaking|that|this|it))?(?:,?\s+please)?|"
+    r"(?:please\s+)?cancel(?:\s+(?:that|this|it))?(?:,?\s+please)?|"
+    r"never\s*mind|nevermind|that(?:'s|\s+is)\s+enough|"
+    r"be\s+quiet|quiet|shut\s+up"
+    r")[.!?]*$",
+    flags=re.IGNORECASE,
+)
+
+
+def _sanitize_steering_output(text: Any) -> tuple[str, bool]:
+    """Remove internal mid-turn steering envelopes from user-visible output."""
+    value = str(text or "")
+    messages = _STEER_BLOCK_RE.findall(value)
+    cleaned = _STEER_BLOCK_RE.sub("\n\n", value)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned, any(_STOP_STEER_RE.fullmatch(message.strip()) for message in messages)
+
+
+class _SteeringStreamScrubber:
+    """Drop steering envelopes even when their delimiters span SSE chunks."""
+
+    def __init__(self):
+        self.buffer = ""
+        self.inside = False
+
+    def feed(self, chunk: str) -> str:
+        self.buffer += chunk
+        visible = []
+        while self.buffer:
+            if self.inside:
+                end = self.buffer.find(_STEER_CLOSE)
+                if end < 0:
+                    self.buffer = self.buffer[-(len(_STEER_CLOSE) - 1):]
+                    break
+                self.buffer = self.buffer[end + len(_STEER_CLOSE):]
+                self.inside = False
+                continue
+            start = self.buffer.find(_STEER_OPEN)
+            if start >= 0:
+                visible.append(self.buffer[:start])
+                self.buffer = self.buffer[start + len(_STEER_OPEN):]
+                self.inside = True
+                continue
+            keep = min(len(self.buffer), len(_STEER_OPEN) - 1)
+            if len(self.buffer) > keep:
+                visible.append(self.buffer[:-keep])
+                self.buffer = self.buffer[-keep:]
+            break
+        return "".join(visible)
+
+    def flush(self) -> str:
+        value = "" if self.inside else self.buffer
+        self.buffer = ""
+        self.inside = False
+        return value
+
 
 def _hermes_version() -> str:
     """Return the hermes-agent version string, or "dev" if it can't be resolved.
@@ -1486,6 +1553,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/capabilities", self._handle_capabilities),
             ("GET", "/v1/skills", self._handle_skills),
             ("GET", "/v1/toolsets", self._handle_toolsets),
+            ("POST", "/v1/tools/call", self._handle_direct_tool_call),
             ("GET", "/api/sessions", self._handle_list_sessions),
             ("POST", "/api/sessions", self._handle_create_session),
             ("GET", "/api/sessions/{session_id}", self._handle_get_session),
@@ -2069,6 +2137,35 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
             },
         })
+
+    async def _handle_direct_tool_call(self, request: "web.Request") -> "web.Response":
+        """Dispatch an operator-allowlisted tool without model mediation."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        allowed = {
+            item.strip()
+            for item in os.getenv("API_SERVER_DIRECT_TOOL_ALLOWLIST", "").split(",")
+            if item.strip()
+        }
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid JSON body"}, status=400)
+        name = str(payload.get("name") or "").strip() if isinstance(payload, dict) else ""
+        arguments = payload.get("arguments") if isinstance(payload, dict) else None
+        if name not in allowed:
+            return web.json_response({"error": "tool is not allowlisted"}, status=403)
+        if not isinstance(arguments, dict):
+            return web.json_response({"error": "arguments must be an object"}, status=400)
+        from tools.registry import registry
+        result_text = await asyncio.to_thread(registry.dispatch, name, arguments)
+        try:
+            result = json.loads(result_text)
+        except (json.JSONDecodeError, TypeError):
+            result = {"result": str(result_text)}
+        status = 502 if isinstance(result, dict) and result.get("error") else 200
+        return web.json_response(result, status=status)
 
     async def _handle_skills(self, request: "web.Request") -> "web.Response":
         """GET /v1/skills — list installed skills visible to the API-server agent.
@@ -4751,8 +4848,15 @@ class APIServerAdapter(BasePlatformAdapter):
                     "timestamp": ts,
                     "tool": tool_name,
                     "preview": preview,
+                    "arguments": args,
                 })
             elif event_type == "tool.completed":
+                result = kwargs.get("result")
+                if not isinstance(result, str):
+                    try:
+                        result = json.dumps(result, ensure_ascii=False, default=str)
+                    except Exception:
+                        result = str(result or "")
                 _push({
                     "event": "tool.completed",
                     "run_id": run_id,
@@ -4760,6 +4864,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     "tool": tool_name,
                     "duration": round(kwargs.get("duration", 0), 3),
                     "error": kwargs.get("is_error", False),
+                    "output": result[:12000],
+                    "output_truncated": len(result) > 12000,
                 })
             elif event_type == "reasoning.available":
                 _push({
@@ -4869,11 +4975,13 @@ class APIServerAdapter(BasePlatformAdapter):
             if self._run_streams.get(run_id) is q:
                 q.put_nowait(event)
 
-        # Also wire stream_delta_callback so message.delta events flow through.
+        # Also wire stream_delta_callback so safe message.delta events flow through.
+        steering_scrubber = _SteeringStreamScrubber()
         def _text_cb(delta: Optional[str]) -> None:
             if delta is None:
                 return
-            if run_id not in self._run_streams:
+            delta = steering_scrubber.feed(delta)
+            if not delta:
                 return
             try:
                 loop.call_soon_threadsafe(_put_event_if_active, {
@@ -5032,7 +5140,24 @@ class APIServerAdapter(BasePlatformAdapter):
                         last_event="run.failed",
                     )
                 else:
+                    tail = steering_scrubber.flush()
+                    if tail:
+                        q.put_nowait({
+                            "event": "message.delta", "run_id": run_id,
+                            "timestamp": time.time(), "delta": tail,
+                        })
                     final_response = result.get("final_response", "") if isinstance(result, dict) else ""
+                    final_response, stop_steer = _sanitize_steering_output(final_response)
+                    if stop_steer:
+                        _put_event_if_active({
+                            "event": "run.cancelled", "run_id": run_id,
+                            "timestamp": time.time(),
+                        })
+                        self._set_run_status(
+                            run_id, "cancelled", output="", usage=usage,
+                            last_event="run.cancelled",
+                        )
+                        return
                     _put_event_if_active({
                         "event": "run.completed",
                         "run_id": run_id,
