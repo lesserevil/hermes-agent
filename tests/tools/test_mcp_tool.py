@@ -5,6 +5,8 @@ All tests use mocks -- no real MCP servers or subprocesses are started.
 
 import asyncio
 import concurrent.futures
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 import json
 import threading
 import time
@@ -171,6 +173,77 @@ class TestMCPStatus:
         assert statuses["failed"]["error"] == "Connection closed"
         assert statuses["disabled"]["status"] == "disabled"
         assert statuses["disabled"]["disabled"] is True
+
+    def test_status_surfaces_live_reconnect_breaker_and_rate_limit(self, monkeypatch):
+        import tools.mcp_tool as mcp_tool
+
+        monkeypatch.setattr(
+            mcp_tool,
+            "_load_mcp_config",
+            lambda: {
+                "live": {"url": "https://live.test/mcp"},
+                "reconnecting": {"url": "https://reconnecting.test/mcp"},
+                "broken": {"url": "https://broken.test/mcp"},
+                "throttled": {"url": "https://throttled.test/mcp"},
+            },
+        )
+        live = SimpleNamespace(
+            session=object(), _registered_tool_names=["one"], _sampling=None,
+            _error=None,
+        )
+        reconnecting = SimpleNamespace(
+            session=None, _registered_tool_names=[], _sampling=None, _error=None,
+        )
+        broken = SimpleNamespace(
+            session=object(), _registered_tool_names=["one"], _sampling=None,
+            _error=None,
+        )
+        throttled = SimpleNamespace(
+            session=object(), _registered_tool_names=["one"], _sampling=None,
+            _error=None,
+        )
+        with mcp_tool._lock:
+            saved_servers = dict(mcp_tool._servers)
+            saved_counts = dict(mcp_tool._server_error_counts)
+            saved_opened = dict(mcp_tool._server_breaker_opened_at)
+            mcp_tool._servers.clear()
+            mcp_tool._servers.update({
+                "live": live,
+                "reconnecting": reconnecting,
+                "broken": broken,
+                "throttled": throttled,
+            })
+            mcp_tool._server_error_counts.clear()
+            mcp_tool._server_error_counts["broken"] = 3
+            mcp_tool._server_breaker_opened_at.clear()
+            mcp_tool._server_breaker_opened_at["broken"] = time.monotonic()
+        with mcp_tool._server_rate_limit_lock:
+            saved_rate_limits = dict(mcp_tool._server_rate_limit_until)
+            mcp_tool._server_rate_limit_until.clear()
+            mcp_tool._server_rate_limit_until["throttled"] = time.monotonic() + 10
+
+        try:
+            statuses = {
+                entry["name"]: entry for entry in mcp_tool.get_mcp_status()
+            }
+        finally:
+            with mcp_tool._lock:
+                mcp_tool._servers.clear()
+                mcp_tool._servers.update(saved_servers)
+                mcp_tool._server_error_counts.clear()
+                mcp_tool._server_error_counts.update(saved_counts)
+                mcp_tool._server_breaker_opened_at.clear()
+                mcp_tool._server_breaker_opened_at.update(saved_opened)
+            with mcp_tool._server_rate_limit_lock:
+                mcp_tool._server_rate_limit_until.clear()
+                mcp_tool._server_rate_limit_until.update(saved_rate_limits)
+
+        assert statuses["live"]["status"] == "connected"
+        assert statuses["reconnecting"]["status"] == "reconnecting"
+        assert statuses["broken"]["status"] == "failed"
+        assert statuses["broken"]["consecutive_failures"] == 3
+        assert statuses["throttled"]["status"] == "rate_limited"
+        assert statuses["throttled"]["retry_after_seconds"] > 0
 
 
 class TestLifecycleConfig:
@@ -757,6 +830,107 @@ class TestToolHandler:
             assert "something went wrong" in result["error"]
         finally:
             _servers.pop("test_srv", None)
+
+    def test_rate_limit_can_succeed_on_fifth_attempt(self):
+        from tools.mcp_tool import _make_tool_handler, _servers
+
+        rate_limited = _make_call_result(
+            "HTTP 429 rate limited; Retry-After: 0.25", is_error=True
+        )
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(side_effect=[
+            rate_limited,
+            rate_limited,
+            rate_limited,
+            rate_limited,
+            _make_call_result("recovered", is_error=False),
+        ])
+        server = _make_mock_server("retry_srv", session=mock_session)
+        _servers["retry_srv"] = server
+
+        try:
+            handler = _make_tool_handler("retry_srv", "search", 120)
+            with (
+                self._patch_mcp_loop(),
+                patch("tools.mcp_tool._wait_for_server_rate_limit"),
+            ):
+                result = json.loads(handler({"query": "horde"}))
+            assert result == {"result": "recovered"}
+            assert mock_session.call_tool.await_count == 5
+        finally:
+            _servers.pop("retry_srv", None)
+
+    def test_rate_limit_uses_retry_after_response_header(self):
+        from tools.mcp_tool import _make_tool_handler, _servers
+
+        class RateLimitError(RuntimeError):
+            response = SimpleNamespace(
+                status_code=429,
+                headers={"Retry-After": "61"},
+            )
+
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(side_effect=[
+            RateLimitError("request failed"),
+            _make_call_result("recovered", is_error=False),
+        ])
+        server = _make_mock_server("header_retry_srv", session=mock_session)
+        _servers["header_retry_srv"] = server
+
+        try:
+            handler = _make_tool_handler("header_retry_srv", "search", 120)
+            with (
+                self._patch_mcp_loop(),
+                patch("tools.mcp_tool._wait_for_server_rate_limit"),
+                patch("tools.mcp_tool._arm_server_rate_limit") as arm_rate_limit,
+            ):
+                result = json.loads(handler({"query": "horde"}))
+            assert result == {"result": "recovered"}
+            arm_rate_limit.assert_called_once_with("header_retry_srv", 61.0)
+        finally:
+            _servers.pop("header_retry_srv", None)
+
+    def test_rate_limit_preserves_wrapped_mcp_retry_metadata(self):
+        from tools.mcp_tool import _make_tool_handler, _servers
+
+        rate_limited = _make_call_result("Too many requests", is_error=True)
+        rate_limited.structuredContent = {
+            "status": 429,
+            "headers": {"retry-after": "75"},
+        }
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(side_effect=[
+            rate_limited,
+            _make_call_result("recovered", is_error=False),
+        ])
+        server = _make_mock_server("wrapped_retry_srv", session=mock_session)
+        _servers["wrapped_retry_srv"] = server
+
+        try:
+            handler = _make_tool_handler("wrapped_retry_srv", "search", 120)
+            with (
+                self._patch_mcp_loop(),
+                patch("tools.mcp_tool._wait_for_server_rate_limit"),
+                patch("tools.mcp_tool._arm_server_rate_limit") as arm_rate_limit,
+            ):
+                result = json.loads(handler({"query": "horde"}))
+            assert result == {"result": "recovered"}
+            arm_rate_limit.assert_called_once_with("wrapped_retry_srv", 75.0)
+        finally:
+            _servers.pop("wrapped_retry_srv", None)
+
+    def test_rate_limit_parses_retry_after_http_date(self):
+        from tools.mcp_tool import _rate_limit_delay
+
+        retry_at = datetime.now(timezone.utc) + timedelta(seconds=90)
+        response = SimpleNamespace(
+            status_code=429,
+            headers={"Retry-After": format_datetime(retry_at, usegmt=True)},
+        )
+
+        delay = _rate_limit_delay(response, attempt=1)
+
+        assert 88 <= delay <= 90
 
     def test_disconnected_server(self):
         from tools.mcp_tool import _make_tool_handler, _servers

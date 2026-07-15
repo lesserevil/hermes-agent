@@ -1971,6 +1971,7 @@ class APIServerAdapter(BasePlatformAdapter):
             parse_active_agents,
             read_runtime_status,
         )
+        from tools.mcp_tool import get_mcp_status
 
         runtime = read_runtime_status() or {}
         gw_state = runtime.get("gateway_state")
@@ -1995,6 +1996,9 @@ class APIServerAdapter(BasePlatformAdapter):
             "version": _hermes_version(),
             "gateway_state": gw_state,
             "platforms": runtime.get("platforms", {}),
+            # Purely in-process state: this does not call or ping any MCP
+            # provider, so dashboards can poll it without causing rate limits.
+            "mcp_servers": get_mcp_status(),
             "active_agents": gw_active,
             "gateway_busy": derive_gateway_busy(
                 gateway_running=True,
