@@ -732,13 +732,18 @@ class TestHealthDetailedEndpoint:
     async def test_health_detailed_returns_ok(self, adapter):
         """GET /health/detailed returns status, platform, and runtime fields."""
         app = _create_app(adapter)
-        with patch("gateway.status.read_runtime_status", return_value={
-            "gateway_state": "running",
-            "platforms": {"telegram": {"state": "connected"}},
-            "active_agents": 2,
-            "exit_reason": None,
-            "updated_at": "2026-04-14T00:00:00Z",
-        }):
+        with (
+            patch("gateway.status.read_runtime_status", return_value={
+                "gateway_state": "running",
+                "platforms": {"telegram": {"state": "connected"}},
+                "active_agents": 2,
+                "exit_reason": None,
+                "updated_at": "2026-04-14T00:00:00Z",
+            }),
+            patch("tools.mcp_tool.get_mcp_status", return_value=[{
+                "name": "github", "status": "connected", "connected": True,
+            }]),
+        ):
             async with TestClient(TestServer(app)) as cli:
                 resp = await cli.get("/health/detailed")
                 assert resp.status == 200
@@ -747,6 +752,9 @@ class TestHealthDetailedEndpoint:
                 assert data["platform"] == "hermes-agent"
                 assert data["gateway_state"] == "running"
                 assert data["platforms"] == {"telegram": {"state": "connected"}}
+                assert data["mcp_servers"] == [{
+                    "name": "github", "status": "connected", "connected": True,
+                }]
                 assert data["active_agents"] == 2
                 # Derived busy/drainable: this endpoint is served BY the live
                 # gateway, so running + 2 agents ⇒ busy and drainable.

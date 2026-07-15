@@ -82,8 +82,10 @@ Thread safety:
 """
 
 import asyncio
+from collections.abc import Mapping
 import contextvars
 import concurrent.futures
+from email.utils import parsedate_to_datetime
 import inspect
 import json
 import logging
@@ -95,7 +97,7 @@ import sys
 import threading
 import time
 from typing import Callable
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Coroutine, Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -2588,7 +2590,7 @@ _CIRCUIT_BREAKER_COOLDOWN_SEC = 60.0
 # a transport failure.
 _server_rate_limit_until: Dict[str, float] = {}
 _server_rate_limit_lock = threading.Lock()
-_RATE_LIMIT_MAX_ATTEMPTS = 3
+_RATE_LIMIT_MAX_ATTEMPTS = 5
 _RATE_LIMIT_BASE_DELAY_SEC = 2.0
 _RATE_LIMIT_MAX_DELAY_SEC = 30.0
 _RECONNECT_WAIT_SEC = 5.0
@@ -2609,7 +2611,139 @@ def _rate_limit_text(value: Any) -> str:
     return ""
 
 
+def _rate_limit_nodes(value: Any):
+    """Yield nested values that may carry HTTP rate-limit metadata."""
+    pending = [value]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if current is None:
+            continue
+        if not isinstance(current, (str, bytes, int, float, bool)):
+            marker = id(current)
+            if marker in seen:
+                continue
+            seen.add(marker)
+        yield current
+
+        if isinstance(current, str):
+            try:
+                parsed = json.loads(current)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if parsed != current:
+                pending.append(parsed)
+        elif isinstance(current, BaseException):
+            pending.extend(getattr(current, "exceptions", ()) or ())
+            pending.extend([
+                getattr(current, "response", None),
+                current.__cause__,
+                current.__context__,
+            ])
+        elif isinstance(current, Mapping):
+            pending.extend(current.values())
+        elif isinstance(current, (list, tuple)):
+            pending.extend(current)
+        else:
+            pending.extend(
+                getattr(current, attr, None)
+                for attr in (
+                    "response",
+                    "headers",
+                    "structuredContent",
+                    "content",
+                )
+            )
+
+
+def _normalized_metadata_key(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value).lower())
+
+
+def _parse_retry_after(value: Any) -> Optional[float]:
+    """Parse Retry-After delta-seconds or an RFC 7231 HTTP-date."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return max(0.0, float(value))
+    if not isinstance(value, str):
+        return None
+
+    candidate = value.strip()
+    try:
+        return max(0.0, float(candidate))
+    except ValueError:
+        pass
+
+    try:
+        retry_at = parsedate_to_datetime(candidate)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=timezone.utc)
+    return max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+
+
+def _retry_after_seconds(value: Any) -> Optional[float]:
+    """Extract Retry-After from HTTP responses or wrapped MCP error data."""
+    for node in _rate_limit_nodes(value):
+        if isinstance(node, Mapping):
+            for key, raw_value in node.items():
+                if _normalized_metadata_key(key) in {
+                    "retryafter",
+                    "retryafterseconds",
+                }:
+                    parsed = _parse_retry_after(raw_value)
+                    if parsed is not None:
+                        return parsed
+        headers = getattr(node, "headers", None)
+        if headers is not None and hasattr(headers, "items"):
+            for key, raw_value in headers.items():
+                if _normalized_metadata_key(key) == "retryafter":
+                    parsed = _parse_retry_after(raw_value)
+                    if parsed is not None:
+                        return parsed
+
+    text = _rate_limit_text(value)
+    numeric_match = re.search(
+        r"retry[-_ ]?after(?:\s*(?:seconds?|secs?))?[\"']?\s*[:=]?\s*"
+        r"[\"']?(\d+(?:\.\d+)?)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if numeric_match:
+        return _parse_retry_after(numeric_match.group(1))
+    date_match = re.search(
+        r"retry[-_ ]?after[^:=]*[:=]\s*[\"']?"
+        r"((?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),\s+\d{2}\s+\w{3}\s+"
+        r"\d{4}\s+\d{2}:\d{2}:\d{2}\s+GMT)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if date_match:
+        return _parse_retry_after(date_match.group(1))
+    return None
+
+
+def _rate_limit_status(value: Any) -> Optional[int]:
+    for node in _rate_limit_nodes(value):
+        status = getattr(node, "status_code", None)
+        if status is not None:
+            try:
+                return int(status)
+            except (TypeError, ValueError):
+                pass
+        if isinstance(node, Mapping):
+            for key, raw_value in node.items():
+                if _normalized_metadata_key(key) in {"status", "statuscode"}:
+                    try:
+                        return int(raw_value)
+                    except (TypeError, ValueError):
+                        pass
+    return None
+
+
 def _is_rate_limited(value: Any) -> bool:
+    if _rate_limit_status(value) == 429:
+        return True
     text = _rate_limit_text(value).lower()
     return bool(text) and (
         "429" in text
@@ -2622,14 +2756,9 @@ def _is_rate_limited(value: Any) -> bool:
 
 def _rate_limit_delay(value: Any, attempt: int) -> float:
     """Honor a Retry-After hint when present, else use bounded backoff."""
-    text = _rate_limit_text(value)
-    match = re.search(
-        r"retry[-_ ]?after(?:\s*(?:seconds?|secs?))?\s*[:=]?\s*(\d+(?:\.\d+)?)",
-        text,
-        flags=re.IGNORECASE,
-    )
-    if match:
-        return min(_RATE_LIMIT_MAX_DELAY_SEC, max(0.25, float(match.group(1))))
+    retry_after = _retry_after_seconds(value)
+    if retry_after is not None:
+        return retry_after
     return min(
         _RATE_LIMIT_MAX_DELAY_SEC,
         _RATE_LIMIT_BASE_DELAY_SEC * (2 ** max(0, attempt - 1)),
@@ -3544,11 +3673,17 @@ def _make_tool_handler(
                 for block in (result.content or []):
                     if hasattr(block, "text"):
                         error_text += block.text
-                return json.dumps({
+                error_payload = {
                     "error": _sanitize_error(
                         error_text or "MCP tool returned an error"
                     )
-                }, ensure_ascii=False)
+                }
+                if _is_rate_limited(result):
+                    error_payload["error_code"] = "rate_limited"
+                    retry_after = _retry_after_seconds(result)
+                    if retry_after is not None:
+                        error_payload["retry_after_seconds"] = retry_after
+                return json.dumps(error_payload, ensure_ascii=False)
 
             # Collect text from content blocks. MCP tool results can also
             # include ImageContent blocks (screenshot / Blockbench / Playwright
@@ -4663,12 +4798,60 @@ def get_mcp_status() -> List[dict]:
         active_servers = dict(_servers)
         connecting = set(_server_connecting)
         connect_errors = dict(_server_connect_errors)
+        error_counts = dict(_server_error_counts)
+        breaker_opened_at = dict(_server_breaker_opened_at)
+    with _server_rate_limit_lock:
+        rate_limit_until = dict(_server_rate_limit_until)
 
     for name, cfg in configured.items():
         transport = cfg.get("transport", "http") if "url" in cfg else "stdio"
         enabled = _parse_boolish(cfg.get("enabled", True), default=True)
         server = active_servers.get(name)
-        if server and server.session is not None:
+        failures = error_counts.get(name, 0)
+        breaker_remaining = max(
+            0.0,
+            _CIRCUIT_BREAKER_COOLDOWN_SEC
+            - (time.monotonic() - breaker_opened_at.get(name, 0.0)),
+        ) if failures >= _CIRCUIT_BREAKER_THRESHOLD else 0.0
+        rate_limit_remaining = max(
+            0.0, rate_limit_until.get(name, 0.0) - time.monotonic()
+        )
+
+        if not enabled:
+            # A server with enabled: false is intentionally not connected — it is
+            # disabled, not failed. Surface that distinction so consumers (banner,
+            # TUI) can render "disabled" rather than an alarming "failed".
+            result.append({
+                "name": name,
+                "transport": transport,
+                "tools": 0,
+                "connected": False,
+                "disabled": True,
+                "status": "disabled",
+            })
+        elif rate_limit_remaining > 0:
+            result.append({
+                "name": name,
+                "transport": transport,
+                "tools": len(server._registered_tool_names) if server else 0,
+                "connected": bool(server and server.session is not None),
+                "disabled": False,
+                "status": "rate_limited",
+                "retry_after_seconds": max(1, int(math.ceil(rate_limit_remaining))),
+            })
+        elif breaker_remaining > 0:
+            result.append({
+                "name": name,
+                "transport": transport,
+                "tools": len(server._registered_tool_names) if server else 0,
+                "connected": bool(server and server.session is not None),
+                "disabled": False,
+                "status": "failed",
+                "consecutive_failures": failures,
+                "retry_after_seconds": max(1, int(math.ceil(breaker_remaining))),
+                "error": f"{failures} consecutive MCP tool failures",
+            })
+        elif server and server.session is not None:
             entry = {
                 "name": name,
                 "transport": transport,
@@ -4680,17 +4863,16 @@ def get_mcp_status() -> List[dict]:
             if server._sampling:
                 entry["sampling"] = dict(server._sampling.metrics)
             result.append(entry)
-        elif not enabled:
-            # A server with enabled: false is intentionally not connected — it is
-            # disabled, not failed. Surface that distinction so consumers (banner,
-            # TUI) can render "disabled" rather than an alarming "failed".
+        elif server:
             result.append({
                 "name": name,
                 "transport": transport,
                 "tools": 0,
                 "connected": False,
-                "disabled": True,
-                "status": "disabled",
+                "disabled": False,
+                "status": "reconnecting",
+                "consecutive_failures": failures,
+                **({"error": str(server._error)} if server._error else {}),
             })
         elif name in connecting:
             result.append({
