@@ -745,7 +745,11 @@ class TestWaitForCallbackNoBlocking:
         """A timed-out daemon callback must not leave accept() holding the port."""
         port = _find_free_port()
         with pytest.raises(OAuthNonInteractiveError, match="callback timed out"):
-            asyncio.run(_wait_for_callback(callback_port=port, timeout=0.01))
+            asyncio.run(_wait_for_callback(
+                callback_port=port,
+                timeout=0.01,
+                allow_noninteractive=True,
+            ))
 
         probe = socket.socket()
         try:

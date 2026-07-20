@@ -920,6 +920,40 @@ class TestChatCompletionsNormalize:
         assert nr.tool_calls[0].name == "terminal"
         assert nr.tool_calls[0].id == "call_123"
 
+    @pytest.mark.parametrize(
+        "tool_name",
+        [
+            "mcp__maas_outlook__outlook_list_messages",
+            "mcp_maas_outlook_outlook_list_messages",
+        ],
+    )
+    def test_textual_deferred_mcp_call_is_normalized(self, transport, tool_name):
+        """Strict whole-response MCP envelopes become normal tool calls."""
+        content = (
+            "<tool_call_result>"
+            f"<tool_name>{tool_name}</tool_name>"
+            '<arguments>{"limit": 5}</arguments>'
+            "</tool_call_result>"
+        )
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(
+                    content=content,
+                    tool_calls=None,
+                    reasoning_content=None,
+                ),
+                finish_reason="stop",
+            )],
+            usage=None,
+        )
+
+        normalized = transport.normalize_response(response)
+
+        assert normalized.content == ""
+        assert normalized.finish_reason == "tool_calls"
+        assert normalized.tool_calls[0].name == tool_name
+        assert normalized.tool_calls[0].arguments == '{"limit": 5}'
+
     def test_tool_call_extra_content_preserved(self, transport):
         """Gemini 3 thinking models attach extra_content with thought_signature
         on tool_calls.  Without this replay on the next turn, the API rejects

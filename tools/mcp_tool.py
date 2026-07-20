@@ -2978,7 +2978,7 @@ class MCPServerTask:
                 # Without this, one hourly disconnect eventually parks a
                 # healthy OAuth connector after five successful renewals.
                 if self._connection_generation != attempt_generation:
-                    retries = 0
+                    self._reconnect_retries = 0
                     backoff = 1.0
 
                 # If this is the first connection attempt, retry with backoff
@@ -4442,19 +4442,14 @@ def _make_tool_handler(
                 # fresh session initializes (_run_stdio/_run_http call
                 # _reset_server_error).
                 if _signal_reconnect(server):
-                    if _wait_for_server_session_ready(
-                        server, timeout=min(5.0, float(tool_timeout or 5.0)),
-                    ):
-                        _reset_server_error(server_name)
-                    else:
-                        _bump_server_error(server_name)
-                        return json.dumps({
-                            "error": (
-                                f"MCP server '{server_name}' transport is down; "
-                                f"reconnect requested. Do NOT retry this tool "
-                                f"immediately — give it a few seconds to come back."
-                            )
-                        }, ensure_ascii=False)
+                    _bump_server_error(server_name)
+                    return json.dumps({
+                        "error": (
+                            f"MCP server '{server_name}' transport is down; "
+                            f"reconnect requested. Do NOT retry this tool "
+                            f"immediately — give it a few seconds to come back."
+                        )
+                    }, ensure_ascii=False)
                 else:
                     _bump_server_error(server_name)
                     return json.dumps({

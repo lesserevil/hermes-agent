@@ -995,10 +995,15 @@ class TestCapabilitiesEndpoint:
             assert data["features"]["chat_completions"] is True
             assert data["features"]["run_status"] is True
             assert data["features"]["run_events_sse"] is True
+            assert data["features"]["direct_tool_call"] is True
             assert data["features"]["session_continuity_header"] == "X-Hermes-Session-Id"
             assert data["endpoints"]["run_status"]["path"] == "/v1/runs/{run_id}"
             assert data["endpoints"]["skills"] == {"method": "GET", "path": "/v1/skills"}
             assert data["endpoints"]["toolsets"] == {"method": "GET", "path": "/v1/toolsets"}
+            assert data["endpoints"]["direct_tool_call"] == {
+                "method": "POST",
+                "path": "/v1/tools/call",
+            }
 
     @pytest.mark.asyncio
     async def test_capabilities_requires_auth_when_key_configured(self, auth_adapter):
@@ -1019,6 +1024,31 @@ class TestCapabilitiesEndpoint:
 # ---------------------------------------------------------------------------
 # /v1/skills and /v1/toolsets endpoints
 # ---------------------------------------------------------------------------
+
+
+class TestDirectToolCallEndpoint:
+    @pytest.mark.asyncio
+    async def test_dispatches_allowlisted_native_mcp_tool(self, adapter, monkeypatch):
+        tool_name = "mcp__maas_outlook__outlook_list_messages"
+        monkeypatch.setenv("API_SERVER_DIRECT_TOOL_ALLOWLIST", tool_name)
+        app = web.Application()
+        app.router.add_post("/v1/tools/call", adapter._handle_direct_tool_call)
+
+        with patch(
+            "tools.registry.registry.dispatch",
+            return_value='{"messages": []}',
+        ) as dispatch:
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(
+                    "/v1/tools/call",
+                    json={"name": tool_name, "arguments": {"limit": 5}},
+                )
+                status = response.status
+                data = await response.json()
+
+        assert status == 200
+        assert data == {"messages": []}
+        dispatch.assert_called_once_with(tool_name, {"limit": 5})
 
 
 class TestSkillsEndpoint:

@@ -134,7 +134,7 @@ class TestMCPStatus:
             "slack": {"url": "https://example.test/mcp", "auth": "oauth"}
         })
         manager = get_manager()
-        manager._entries["slack"] = _ProviderEntry(
+        manager._entries[manager._key("slack")] = _ProviderEntry(
             server_url="https://example.test/mcp",
             oauth_config={},
             authorization_url="https://login.example.test/oauth?state=abc",

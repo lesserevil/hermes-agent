@@ -434,13 +434,14 @@ def _make_hermes_provider_class() -> Optional[type]:
                 )
 
         async def async_auth_flow(self, request):  # type: ignore[override]
+            hermes_home = getattr(self, "_hermes_home", None)
             # Pre-flow hook: ask the manager to refresh from disk if needed.
             # Any failure here is non-fatal — we just log and proceed with
             # whatever state the SDK already has.
             try:
                 await get_manager().invalidate_if_disk_changed(
                     self._hermes_server_name,
-                    hermes_home=self._hermes_home,
+                    hermes_home=hermes_home,
                 )
             except Exception as exc:  # pragma: no cover — defensive
                 logger.debug(
@@ -476,7 +477,7 @@ def _make_hermes_provider_class() -> Optional[type]:
                 # 401 branch so a subsequent cold-load skips discovery.
                 self._persist_oauth_metadata_if_changed()
                 get_manager().clear_auth_required(
-                    self._hermes_server_name, hermes_home=self._hermes_home
+                    self._hermes_server_name, hermes_home=hermes_home
                 )
                 return
             finally:
@@ -487,7 +488,7 @@ def _make_hermes_provider_class() -> Optional[type]:
                 # disconnect/reconnect failure this wrapper must prevent.
                 await inner.aclose()
                 get_manager().release_browser_auth(
-                    self._hermes_server_name, hermes_home=self._hermes_home
+                    self._hermes_server_name, hermes_home=hermes_home
                 )
 
     return HermesMCPOAuthProvider

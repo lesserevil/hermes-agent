@@ -4724,7 +4724,7 @@ def run_conversation(
                             tc.function.name = repaired
 
                 # Deferred MCP tools are intentionally absent from the
-                # model-facing function list.  If a model invents a MaaS name,
+                # model-facing function list. If a model invents an MCP name,
                 # do not execute a fuzzy match and do not strand the turn on a
                 # generic "tool does not exist" error.  Convert the call into
                 # a scoped catalog search so the next model step sees valid
@@ -4739,7 +4739,7 @@ def run_conversation(
                     for tc in assistant_message.tool_calls:
                         invented_name = tc.function.name
                         if (
-                            invented_name.startswith("mcp_maas_")
+                            invented_name.startswith(("mcp__", "mcp_maas_"))
                             and invented_name not in scoped_deferred_names
                             and _ts.TOOL_SEARCH_NAME in agent.valid_tool_names
                         ):

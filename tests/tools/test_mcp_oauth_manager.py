@@ -129,7 +129,7 @@ def test_manager_exposes_and_clears_authorization_handoff():
     from tools.mcp_oauth_manager import MCPOAuthManager, _ProviderEntry
 
     mgr = MCPOAuthManager()
-    mgr._entries["slack"] = _ProviderEntry(
+    mgr._entries[mgr._key("slack")] = _ProviderEntry(
         server_url="https://example.test/mcp",
         oauth_config={},
         authorization_url="https://login.example.test/oauth?state=abc",
@@ -365,19 +365,20 @@ def test_manager_builds_hermes_provider_subclass(tmp_path, monkeypatch):
     assert provider._hermes_server_name == "srv"
 
 
-def test_manager_fails_fast_noninteractive_without_cached_tokens(tmp_path, monkeypatch):
-    """A daemon without cached MCP OAuth tokens must not enter browser auth."""
+def test_manager_allows_noninteractive_authorization_handoff(tmp_path, monkeypatch):
+    """The gateway must be able to start a background authorization flow."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     _set_interactive_stdin(monkeypatch, is_tty=False)
-    from tools.mcp_oauth import OAuthNonInteractiveError
     from tools.mcp_oauth_manager import MCPOAuthManager
 
     mgr = MCPOAuthManager()
 
-    with pytest.raises(OAuthNonInteractiveError, match="non-interactive"):
-        mgr.get_or_build_provider("linear", "https://mcp.linear.app/mcp", None)
+    provider = mgr.get_or_build_provider(
+        "linear", "https://mcp.linear.app/mcp", None
+    )
 
-    assert mgr._entries[mgr._key("linear")].provider is None
+    assert provider is not None
+    assert mgr._entries[mgr._key("linear")].provider is provider
 
 
 # ---------------------------------------------------------------------------
