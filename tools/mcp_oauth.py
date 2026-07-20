@@ -640,7 +640,12 @@ def _make_callback_handler() -> tuple[type, dict]:
 # ---------------------------------------------------------------------------
 
 
-def _make_redirect_handler(port: int, redirect_uri: str | None = None):
+def _make_redirect_handler(
+    port: int,
+    redirect_uri: str | None = None,
+    *,
+    allow_noninteractive: bool = False,
+):
     """Return a redirect handler closure that closes over the given port.
 
     Using a closure instead of reading the module-level ``_oauth_port`` avoids
@@ -675,10 +680,11 @@ def _make_redirect_handler(port: int, redirect_uri: str | None = None):
         # promptly and the caller can skip this server with an actionable warning.
         # This intentionally re-checks interactivity here rather than trusting the
         # token-file existence guard alone. See #57836.
-        _raise_if_non_interactive(
-            "MCP OAuth requires browser authorization but no interactive "
-            "session is available (non-interactive/background context)."
-        )
+        if not allow_noninteractive:
+            _raise_if_non_interactive(
+                "MCP OAuth requires browser authorization but no interactive "
+                "session is available (non-interactive/background context)."
+            )
 
         msg = (
             f"\n  MCP OAuth: authorization required.\n"
@@ -737,7 +743,12 @@ def _make_redirect_handler(port: int, redirect_uri: str | None = None):
     return _redirect_handler
 
 
-async def _wait_for_callback() -> tuple[str, str | None]:
+async def _wait_for_callback(
+    callback_port: int | None = None,
+    timeout: float = 300.0,
+    *,
+    allow_noninteractive: bool = False,
+) -> tuple[str, str | None]:
     """Wait for the OAuth callback on the legacy module-level port.
 
     Kept for backwards compatibility with callers that never went through
@@ -750,15 +761,25 @@ async def _wait_for_callback() -> tuple[str, str | None]:
             that ``build_oauth_auth`` was skipped — the asserting form below
             was a silent bug when running Python with ``-O``/``-OO``.
     """
-    if _oauth_port is None:
+    port = callback_port if callback_port is not None else _oauth_port
+    if port is None:
         raise RuntimeError(
             "OAuth callback port not set — build_oauth_auth must be called "
             "before _wait_for_oauth_callback"
         )
-    return await _make_callback_waiter(_oauth_port)()
+    return await _make_callback_waiter(
+        port,
+        timeout=timeout,
+        allow_noninteractive=allow_noninteractive,
+    )()
 
 
-def _make_callback_waiter(port: int):
+def _make_callback_waiter(
+    port: int,
+    *,
+    timeout: float = 300.0,
+    allow_noninteractive: bool = False,
+):
     """Return a callback waiter bound to a single OAuth flow's port.
 
     Closing over the port (instead of reading the module-level
@@ -795,11 +816,12 @@ def _make_callback_waiter(port: int):
         # server. This guard holds "regardless of whether a token file exists"
         # — the point the build_oauth_auth token-file guard cannot cover.
         # See #57836.
-        _raise_if_non_interactive(
-            "OAuth callback requires an interactive session but none is "
-            "available (non-interactive/background context); skipping browser "
-            "authorization without binding a callback listener."
-        )
+        if not allow_noninteractive:
+            _raise_if_non_interactive(
+                "OAuth callback requires an interactive session but none is "
+                "available (non-interactive/background context); skipping browser "
+                "authorization without binding a callback listener."
+            )
 
         handler_cls, result = _make_callback_handler()
 
@@ -838,7 +860,14 @@ def _make_callback_waiter(port: int):
                 "in the server config, then retry."
             ) from exc
 
-        server_thread = threading.Thread(target=server.handle_request, daemon=True)
+        # A cancellable serve loop is required here: closing a listening
+        # socket from another thread does not reliably interrupt a blocking
+        # handle_request(), which otherwise leaks the callback port.
+        server_thread = threading.Thread(
+            target=server.serve_forever,
+            kwargs={"poll_interval": 0.1},
+            daemon=True,
+        )
         server_thread.start()
 
         # Optional paste-fallback thread: only on interactive TTYs. Reads one
@@ -859,7 +888,6 @@ def _make_callback_waiter(port: int):
             )
             paste_thread.start()
 
-        timeout = 300.0
         poll_interval = 0.5
         elapsed = 0.0
         try:
@@ -869,6 +897,8 @@ def _make_callback_waiter(port: int):
                 await asyncio.sleep(poll_interval)
                 elapsed += poll_interval
         finally:
+            server.shutdown()
+            server_thread.join(timeout=2.0)
             server.server_close()
 
         if result["error"] == _USER_SKIPPED_SENTINEL:
@@ -1178,7 +1208,9 @@ def build_oauth_auth(
     redirect_handler = _make_redirect_handler(
         resolved_port, redirect_uri=cfg.get("redirect_uri") or None
     )
-    callback_handler = _make_callback_waiter(resolved_port)
+    callback_handler = _make_callback_waiter(
+        resolved_port, timeout=float(cfg.get("timeout", 300))
+    )
 
     return OAuthClientProvider(
         server_url=server_url,
