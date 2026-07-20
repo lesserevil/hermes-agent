@@ -32,6 +32,24 @@ def test_manager_is_singleton():
     assert m1 is m2
 
 
+def test_manager_exposes_and_clears_authorization_handoff():
+    from tools.mcp_oauth_manager import MCPOAuthManager, _ProviderEntry
+
+    mgr = MCPOAuthManager()
+    mgr._entries["slack"] = _ProviderEntry(
+        server_url="https://example.test/mcp",
+        oauth_config={},
+        authorization_url="https://login.example.test/oauth?state=abc",
+    )
+
+    assert mgr.get_auth_required("slack") == {
+        "authorization_url": "https://login.example.test/oauth?state=abc",
+        "error": "OAuth authorization requires user consent.",
+    }
+    mgr.clear_auth_required("slack")
+    assert mgr.get_auth_required("slack") is None
+
+
 def test_manager_get_or_build_provider_caches(tmp_path, monkeypatch):
     """Calling get_or_build_provider twice with same name returns same provider."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))

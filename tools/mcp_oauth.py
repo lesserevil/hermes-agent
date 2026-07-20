@@ -523,7 +523,9 @@ def _make_callback_handler() -> tuple[type, dict]:
 # ---------------------------------------------------------------------------
 
 
-async def _redirect_handler(authorization_url: str) -> None:
+async def _redirect_handler(
+    authorization_url: str, callback_port: int | None = None
+) -> None:
     """Show the authorization URL to the user.
 
     Opens the browser automatically when possible; always prints the URL
@@ -542,10 +544,11 @@ async def _redirect_handler(authorization_url: str) -> None:
     # opened.  Two ways out: paste the redirect URL back (default fallback,
     # offered by _wait_for_callback on interactive TTYs), or set up an SSH
     # port forward so the redirect tunnels through.
-    if _oauth_port and (os.getenv("SSH_CLIENT") or os.getenv("SSH_TTY")):
+    port = callback_port if callback_port is not None else _oauth_port
+    if port and (os.getenv("SSH_CLIENT") or os.getenv("SSH_TTY")):
         print(
             f"  Remote session detected. After you authorize, the provider redirects to\n"
-            f"    http://127.0.0.1:{_oauth_port}/callback\n"
+            f"    http://127.0.0.1:{port}/callback\n"
             f"  which only the listener on THIS machine can receive. Two options:\n"
             f"\n"
             f"    1. Easiest — when your browser shows a connection error after\n"
@@ -554,7 +557,7 @@ async def _redirect_handler(authorization_url: str) -> None:
             f"       enough to complete the flow.\n"
             f"\n"
             f"    2. Or forward the port first in a separate terminal:\n"
-            f"         ssh -N -L {_oauth_port}:127.0.0.1:{_oauth_port} <user>@<this-host>\n"
+            f"         ssh -N -L {port}:127.0.0.1:{port} <user>@<this-host>\n"
             f"       then open the URL above and let it redirect normally.\n"
             f"\n"
             f"  See: https://hermes-agent.nousresearch.com/docs/guides/oauth-over-ssh\n",
@@ -574,7 +577,9 @@ async def _redirect_handler(authorization_url: str) -> None:
         print("  (Headless environment detected — open the URL manually.)\n", file=sys.stderr)
 
 
-async def _wait_for_callback() -> tuple[str, str | None]:
+async def _wait_for_callback(
+    callback_port: int | None = None, timeout: float = 300.0
+) -> tuple[str, str | None]:
     """Wait for the OAuth callback to arrive on the local callback server.
 
     Uses the module-level ``_oauth_port`` which is set by ``build_oauth_auth``
@@ -594,7 +599,8 @@ async def _wait_for_callback() -> tuple[str, str | None]:
             that ``build_oauth_auth`` was skipped — the asserting form below
             was a silent bug when running Python with ``-O``/``-OO``.
     """
-    if _oauth_port is None:
+    port = callback_port if callback_port is not None else _oauth_port
+    if port is None:
         raise RuntimeError(
             "OAuth callback port not set — build_oauth_auth must be called "
             "before _wait_for_oauth_callback"
@@ -606,7 +612,7 @@ async def _wait_for_callback() -> tuple[str, str | None]:
 
     # Start a temporary server on the known port
     try:
-        server = HTTPServer(("127.0.0.1", _oauth_port), handler_cls)
+        server = HTTPServer(("127.0.0.1", port), handler_cls)
     except OSError:
         # Port already in use — the server from build_oauth_auth is running.
         # Fall back to polling the server started by build_oauth_auth.
@@ -615,7 +621,14 @@ async def _wait_for_callback() -> tuple[str, str | None]:
             "Complete the authorization in a browser first, then retry."
         )
 
-    server_thread = threading.Thread(target=server.handle_request, daemon=True)
+    # serve_forever + shutdown is deliberate. Closing a listening socket from
+    # another thread does not reliably interrupt handle_request()'s blocking
+    # accept(), which leaked this listener and left the callback port occupied.
+    server_thread = threading.Thread(
+        target=server.serve_forever,
+        kwargs={"poll_interval": 0.1},
+        daemon=True,
+    )
     server_thread.start()
 
     # Optional paste-fallback thread: only on interactive TTYs. Reads one
@@ -636,7 +649,6 @@ async def _wait_for_callback() -> tuple[str, str | None]:
         )
         paste_thread.start()
 
-    timeout = 300.0
     poll_interval = 0.5
     elapsed = 0.0
     try:
@@ -646,6 +658,8 @@ async def _wait_for_callback() -> tuple[str, str | None]:
             await asyncio.sleep(poll_interval)
             elapsed += poll_interval
     finally:
+        server.shutdown()
+        server_thread.join(timeout=2.0)
         server.server_close()
 
     if result["error"] == _USER_SKIPPED_SENTINEL:
@@ -888,15 +902,24 @@ def build_oauth_auth(
             "initial authorization, then cached tokens will be reused."
         )
 
-    _configure_callback_port(cfg)
+    callback_port = _configure_callback_port(cfg)
     client_metadata = _build_client_metadata(cfg)
     _maybe_preregister_client(storage, cfg, client_metadata)
+
+    async def redirect_handler(authorization_url: str) -> None:
+        await _redirect_handler(authorization_url, callback_port=callback_port)
+
+    async def callback_handler() -> tuple[str, str | None]:
+        return await _wait_for_callback(
+            callback_port=callback_port,
+            timeout=float(cfg.get("timeout", 300)),
+        )
 
     return OAuthClientProvider(
         server_url=server_url,
         client_metadata=client_metadata,
         storage=storage,
-        redirect_handler=_redirect_handler,
-        callback_handler=_wait_for_callback,
+        redirect_handler=redirect_handler,
+        callback_handler=callback_handler,
         timeout=float(cfg.get("timeout", 300)),
     )

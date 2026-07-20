@@ -125,6 +125,26 @@ class TestLoadMCPConfig:
 
 
 class TestMCPStatus:
+    def test_status_reports_active_oauth_handoff(self, monkeypatch):
+        import tools.mcp_tool as mcp_tool
+        from tools.mcp_oauth_manager import get_manager, _ProviderEntry
+
+        monkeypatch.setattr(mcp_tool, "_load_mcp_config", lambda: {
+            "slack": {"url": "https://example.test/mcp", "auth": "oauth"}
+        })
+        manager = get_manager()
+        manager._entries["slack"] = _ProviderEntry(
+            server_url="https://example.test/mcp",
+            oauth_config={},
+            authorization_url="https://login.example.test/oauth?state=abc",
+        )
+
+        status = mcp_tool.get_mcp_status()[0]
+
+        assert status["status"] == "needs_auth"
+        assert status["authorization_url"].startswith("https://login.example.test/")
+        manager._entries.pop("slack", None)
+
     def test_status_distinguishes_configured_connecting_failed_and_disabled(
         self, monkeypatch
     ):
@@ -1986,6 +2006,49 @@ class TestReconnection:
                 await server.run({"command": "test"})
 
             assert run_count >= 2  # At least one reconnection attempt
+
+        asyncio.run(_test())
+
+    def test_successful_sessions_reset_reconnect_failure_budget(self):
+        """Independent post-connect drops must not accumulate until parking.
+
+        OAuth MCP sessions commonly disconnect when their hourly access token
+        expires.  Each replacement session can initialize successfully and
+        run for an hour before the next drop; those are separate outages, not
+        consecutive failed connection attempts.
+        """
+        from tools import mcp_tool
+        from tools.mcp_tool import MCPServerTask
+
+        run_count = 0
+        target_server = None
+        original_run_stdio = MCPServerTask._run_stdio
+
+        async def patched_run_stdio(self_srv, config):
+            nonlocal run_count, target_server
+            run_count += 1
+            if target_server is not self_srv:
+                return await original_run_stdio(self_srv, config)
+            if run_count <= 4:
+                self_srv.session = MagicMock()
+                self_srv._connection_generation += 1
+                self_srv._ready.set()
+                raise ConnectionError(f"healthy session {run_count} expired")
+            self_srv.session = MagicMock()
+            self_srv._connection_generation += 1
+            self_srv._shutdown_event.set()
+
+        async def _test():
+            nonlocal target_server
+            server = MCPServerTask("oauth_like_srv")
+            target_server = server
+
+            with patch.object(MCPServerTask, "_run_stdio", patched_run_stdio), \
+                 patch.object(mcp_tool, "_MAX_RECONNECT_RETRIES", 2), \
+                 patch("asyncio.sleep", new_callable=AsyncMock):
+                await server.run({"command": "test"})
+
+            assert run_count == 5
 
         asyncio.run(_test())
 
@@ -4433,3 +4496,14 @@ class TestMcpParallelToolCalls:
             register_mcp_servers(config_off)
         with _lock:
             assert sanitize_mcp_name_component("toggle_srv") not in _parallel_safe_servers
+def test_auth_error_detection_recurses_into_exception_group(monkeypatch):
+    from tools import mcp_tool
+
+    class FakeAuthError(Exception):
+        pass
+
+    monkeypatch.setattr(mcp_tool, "_AUTH_ERROR_TYPES", (FakeAuthError,))
+
+    assert mcp_tool._is_auth_error(
+        ExceptionGroup("transport", [RuntimeError("noise"), FakeAuthError("oauth")])
+    ) is True

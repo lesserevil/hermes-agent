@@ -1444,7 +1444,7 @@ class MCPServerTask:
         "_registered_tool_names", "_auth_type", "_refresh_lock",
         "_rpc_lock", "_pending_refresh_tasks",
         "_pending_call_context",
-        "initialize_result", "_ping_unsupported",
+        "initialize_result", "_ping_unsupported", "_connection_generation",
     )
 
     def __init__(self, name: str):
@@ -1498,6 +1498,12 @@ class MCPServerTask:
         # back to ``list_tools`` (the pre-ping probe) so we neither spam pings
         # nor reconnect-loop. Reset on each fresh transport connection.
         self._ping_unsupported: bool = False
+        # Incremented after each transport successfully initializes and
+        # discovers tools.  The outer reconnect loop uses this to distinguish
+        # a failed connection attempt from a healthy session that later
+        # expired or disconnected; only consecutive failures before
+        # initialization should consume the reconnect budget.
+        self._connection_generation: int = 0
 
     def _is_http(self) -> bool:
         """Check if this server uses HTTP transport."""
@@ -1914,6 +1920,7 @@ class MCPServerTask:
                     self.initialize_result = await session.initialize()
                     self.session = session
                     await self._discover_tools()
+                    self._connection_generation += 1
                     self._ready.set()
                     # Session is live again: clear any breaker state from a
                     # prior outage so the first call after recovery isn't
@@ -2149,6 +2156,7 @@ class MCPServerTask:
                     self.initialize_result = await session.initialize()
                     self.session = session
                     await self._discover_tools()
+                    self._connection_generation += 1
                     self._ready.set()
                     # Session is live again: clear any breaker state from a
                     # prior outage so the first call after recovery isn't
@@ -2202,6 +2210,7 @@ class MCPServerTask:
                         self.initialize_result = await session.initialize()
                         self.session = session
                         await self._discover_tools()
+                        self._connection_generation += 1
                         self._ready.set()
                         # Session is live again: clear any breaker state from
                         # a prior outage so the first call after recovery
@@ -2229,6 +2238,7 @@ class MCPServerTask:
                     self.initialize_result = await session.initialize()
                     self.session = session
                     await self._discover_tools()
+                    self._connection_generation += 1
                     self._ready.set()
                     # Session is live again: clear any breaker state from a
                     # prior outage so the first call after recovery isn't
@@ -2355,6 +2365,7 @@ class MCPServerTask:
         backoff = 1.0
 
         while True:
+            attempt_generation = self._connection_generation
             try:
                 if self._is_http():
                     await self._run_http(config)
@@ -2402,6 +2413,17 @@ class MCPServerTask:
                 raise
             except Exception as exc:
                 self.session = None
+
+                # A transport can initialize successfully, stay healthy for
+                # hours, and then raise when its remote session or OAuth token
+                # expires.  That is a new outage, not another failure from the
+                # previous reconnect streak.  Reset the local retry budget
+                # whenever this attempt reached a fully initialized session.
+                # Without this, one hourly disconnect eventually parks a
+                # healthy OAuth connector after five successful renewals.
+                if self._connection_generation != attempt_generation:
+                    retries = 0
+                    backoff = 1.0
 
                 # If this is the first connection attempt, retry with backoff
                 # before giving up. A transient DNS/network blip at startup
@@ -2933,6 +2955,12 @@ def _is_auth_error(exc: BaseException) -> bool:
     response status code is 401. Other HTTP errors fall through to the
     generic error path in the tool handlers.
     """
+    # anyio/asyncio task groups wrap transport failures in ExceptionGroup.
+    # Inspect the leaves so an OAuth error is not mislabeled as a generic
+    # reconnect failure merely because it crossed a task-group boundary.
+    if isinstance(exc, BaseExceptionGroup):
+        return any(_is_auth_error(child) for child in exc.exceptions)
+
     types = _get_auth_error_types()
     if not types or not isinstance(exc, types):
         return False
@@ -4816,6 +4844,16 @@ def get_mcp_status() -> List[dict]:
         rate_limit_remaining = max(
             0.0, rate_limit_until.get(name, 0.0) - time.monotonic()
         )
+        auth_required = None
+        if cfg.get("auth") == "oauth" or cfg.get("oauth") is not None:
+            try:
+                from tools.mcp_oauth_manager import get_manager
+                auth_required = get_manager().get_auth_required(name)
+            except Exception:  # pragma: no cover - health must remain available
+                logger.debug(
+                    "Could not read OAuth handoff state for '%s'", name,
+                    exc_info=True,
+                )
 
         if not enabled:
             # A server with enabled: false is intentionally not connected — it is
@@ -4828,6 +4866,16 @@ def get_mcp_status() -> List[dict]:
                 "connected": False,
                 "disabled": True,
                 "status": "disabled",
+            })
+        elif auth_required:
+            result.append({
+                "name": name,
+                "transport": transport,
+                "tools": 0,
+                "connected": False,
+                "disabled": False,
+                "status": "needs_auth",
+                **auth_required,
             })
         elif rate_limit_remaining > 0:
             result.append({

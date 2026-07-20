@@ -3,6 +3,7 @@
 import json
 import os
 import stat
+import socket
 import sys
 from io import BytesIO
 from unittest.mock import patch, MagicMock
@@ -541,6 +542,18 @@ class TestWaitForCallbackNoBlocking:
             with patch("builtins.input", side_effect=AssertionError("input() must not be called")):
                 with pytest.raises(OAuthNonInteractiveError, match="callback timed out"):
                     asyncio.run(_wait_for_callback())
+
+    def test_timeout_releases_callback_port(self):
+        """A timed-out daemon callback must not leave accept() holding the port."""
+        port = _find_free_port()
+        with pytest.raises(OAuthNonInteractiveError, match="callback timed out"):
+            asyncio.run(_wait_for_callback(callback_port=port, timeout=0.01))
+
+        probe = socket.socket()
+        try:
+            probe.bind(("127.0.0.1", port))
+        finally:
+            probe.close()
 
 
 class TestBuildOAuthAuthNonInteractive:

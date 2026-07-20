@@ -95,6 +95,8 @@ class _ProviderEntry:
     last_mtime_ns: int = 0
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     pending_401: dict[str, "asyncio.Future[bool]"] = field(default_factory=dict)
+    authorization_url: str = ""
+    browser_lock_held: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +173,16 @@ def _make_hermes_provider_class() -> Optional[type]:
                 kwargs["redirect_handler"] = scoped_redirect_handler
             super().__init__(*args, **kwargs)
             self._hermes_server_name = server_name
+            # OAuthClientProvider holds this lock across yields from its
+            # async_auth_flow generator.  HTTPX may close that generator from
+            # an async-generator cleanup task when a streaming MCP transport
+            # disconnects.  anyio.Lock is task-owned, so its __aexit__ then
+            # raises "The current task is not holding this lock" and leaves
+            # the provider permanently locked; every reconnect hangs behind
+            # it.  asyncio.Lock has the mutual-exclusion semantics the SDK
+            # needs here without task ownership, allowing generator cleanup
+            # to release it safely.  Hermes' MCP runtime is asyncio-only.
+            self.context.lock = asyncio.Lock()
             # When the client_id comes from config.yaml (pre-registered), an
             # invalid_client rejection means the *config* is wrong — deleting
             # client.json would just be re-seeded from config and re-running
@@ -460,7 +472,16 @@ def _make_hermes_provider_class() -> Optional[type]:
                 # Persist any metadata the SDK discovered lazily during the
                 # 401 branch so a subsequent cold-load skips discovery.
                 self._persist_oauth_metadata_if_changed()
+                get_manager().clear_auth_required(self._hermes_server_name)
                 return
+            finally:
+                # Explicitly close the inner SDK generator in the same cleanup
+                # task that closes this wrapper.  Otherwise it is finalized
+                # later by an unrelated ``async_generator_athrow`` task while
+                # still holding the OAuth context lock, which is the live
+                # disconnect/reconnect failure this wrapper must prevent.
+                await inner.aclose()
+                get_manager().release_browser_auth(self._hermes_server_name)
 
     return HermesMCPOAuthProvider
 
@@ -489,6 +510,9 @@ class MCPOAuthManager:
         # event loop's weak-reference bookkeeping cannot GC them mid-run
         # and leave `await pending` waiters hanging forever.
         self._inflight_tasks: set[asyncio.Task] = set()
+        # All configured OAuth clients currently share a registered callback
+        # port. Only one interactive browser flow may own that port at a time.
+        self._browser_auth_lock = asyncio.Lock()
 
     # -- Provider construction / caching -------------------------------------
 
@@ -575,9 +599,39 @@ class MCPOAuthManager:
                 "authorization."
             )
 
-        _configure_callback_port(cfg)
+        callback_port = _configure_callback_port(cfg)
         client_metadata = _build_client_metadata(cfg)
         _maybe_preregister_client(storage, cfg, client_metadata)
+
+        async def redirect_handler(authorization_url: str) -> None:
+            await self._browser_auth_lock.acquire()
+            entry.browser_lock_held = True
+            entry.authorization_url = authorization_url
+            try:
+                await _redirect_handler(
+                    authorization_url, callback_port=callback_port
+                )
+            except BaseException:
+                entry.browser_lock_held = False
+                self._browser_auth_lock.release()
+                raise
+
+        async def callback_handler() -> tuple[str, str | None]:
+            try:
+                return await _wait_for_callback(
+                    callback_port=callback_port,
+                    timeout=float(cfg.get("timeout", 300)),
+                )
+            except BaseException:
+                # The URL contains one-time state + PKCE values and is only
+                # usable while this callback listener is alive. Never leave a
+                # timed-out/cancelled handoff advertised through health.
+                entry.authorization_url = ""
+                raise
+            finally:
+                if entry.browser_lock_held:
+                    entry.browser_lock_held = False
+                    self._browser_auth_lock.release()
 
         return _HERMES_PROVIDER_CLS(
             server_name=server_name,
@@ -586,10 +640,32 @@ class MCPOAuthManager:
             server_url=entry.server_url,
             client_metadata=client_metadata,
             storage=storage,
-            redirect_handler=_redirect_handler,
-            callback_handler=_wait_for_callback,
+            redirect_handler=redirect_handler,
+            callback_handler=callback_handler,
             timeout=float(cfg.get("timeout", 300)),
         )
+
+    def get_auth_required(self, server_name: str) -> Optional[dict[str, str]]:
+        """Return the active browser-consent handoff for a connector."""
+        entry = self._entries.get(server_name)
+        if entry is None or not entry.authorization_url:
+            return None
+        return {
+            "authorization_url": entry.authorization_url,
+            "error": "OAuth authorization requires user consent.",
+        }
+
+    def clear_auth_required(self, server_name: str) -> None:
+        entry = self._entries.get(server_name)
+        if entry is not None:
+            entry.authorization_url = ""
+
+    def release_browser_auth(self, server_name: str) -> None:
+        """Defensively release callback ownership when an auth flow is cancelled."""
+        entry = self._entries.get(server_name)
+        if entry is not None and entry.browser_lock_held:
+            entry.browser_lock_held = False
+            self._browser_auth_lock.release()
 
     def remove(self, server_name: str) -> None:
         """Evict the provider from cache AND delete tokens from disk.

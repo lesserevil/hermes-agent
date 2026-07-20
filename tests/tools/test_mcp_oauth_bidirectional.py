@@ -28,6 +28,8 @@ the bridge forwards responses correctly into the inner SDK generator.
 """
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 
@@ -113,6 +115,72 @@ async def test_hermes_provider_forwards_asend_values(tmp_path, monkeypatch):
     # non-403 exit, and the generator ends cleanly (StopAsyncIteration).
     with pytest.raises(StopAsyncIteration):
         await flow.asend(fake_response)
+
+
+@pytest.mark.asyncio
+async def test_hermes_provider_flow_can_close_from_cleanup_task(tmp_path, monkeypatch):
+    """A transport disconnect may close the auth flow from another task.
+
+    The SDK holds ``context.lock`` across the generator's outbound request
+    yield.  Its default ``anyio.Lock`` is task-owned and raises during
+    cross-task async-generator cleanup, poisoning the provider so all later
+    reconnects hang.  Hermes uses an ``asyncio.Lock`` so cleanup can release
+    the lock and the next auth flow can proceed.
+    """
+    import httpx
+    from mcp.shared.auth import OAuthClientMetadata, OAuthToken
+    from pydantic import AnyUrl
+
+    from tools.mcp_oauth import HermesTokenStorage
+    from tools.mcp_oauth_manager import _HERMES_PROVIDER_CLS, reset_manager_for_tests
+
+    assert _HERMES_PROVIDER_CLS is not None
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    reset_manager_for_tests()
+
+    storage = HermesTokenStorage("srv")
+    await storage.set_tokens(
+        OAuthToken(
+            access_token="old_access",
+            token_type="Bearer",
+            expires_in=3600,
+        )
+    )
+    metadata = OAuthClientMetadata(
+        redirect_uris=[AnyUrl("http://127.0.0.1:12345/callback")],
+        client_name="Hermes Agent",
+    )
+    provider = _HERMES_PROVIDER_CLS(
+        server_name="srv",
+        server_url="https://example.com/mcp",
+        client_metadata=metadata,
+        storage=storage,
+        redirect_handler=_noop_redirect,
+        callback_handler=_noop_callback,
+    )
+
+    flow = provider.async_auth_flow(
+        httpx.Request("POST", "https://example.com/mcp")
+    )
+
+    # Start the generator in one task, matching HTTPX's request-driving task.
+    outbound = await asyncio.create_task(flow.__anext__())
+    assert outbound.url.host == "example.com"
+
+    # Close it from this different task, matching async-generator cleanup
+    # after a streaming transport disconnect.  This raised RuntimeError with
+    # the SDK's task-owned anyio.Lock.
+    await flow.aclose()
+    assert not provider.context.lock.locked()
+
+    # The lock was not poisoned: a subsequent reconnect can enter auth_flow.
+    retry_flow = provider.async_auth_flow(
+        httpx.Request("POST", "https://example.com/mcp")
+    )
+    retry_outbound = await asyncio.wait_for(retry_flow.__anext__(), timeout=1)
+    assert retry_outbound.url.host == "example.com"
+    await retry_flow.aclose()
 
 
 @pytest.mark.asyncio
