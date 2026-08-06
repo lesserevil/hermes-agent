@@ -97,6 +97,48 @@ def test_mcp_oauth_helpers_use_dashboard_flow_without_loopback_port():
     assert flow.authorization_url == "https://idp.example/authorize?state=state-4"
 
 
+def test_oauth_handlers_replace_stale_captured_flow_with_active_retry():
+    from tools.mcp_dashboard_oauth import (
+        DashboardOAuthFlow,
+        shared_dashboard_oauth_flow,
+    )
+    from tools.mcp_oauth import _make_callback_waiter, _make_redirect_handler
+
+    stale = DashboardOAuthFlow(
+        flow_id="old",
+        server_name="reports",
+        profile=None,
+        hermes_home="/tmp/hermes-test",
+        redirect_uri="https://agent.example/mcp/oauth/callback/reports",
+    )
+    stale.mark_error("expired")
+    active = DashboardOAuthFlow(
+        flow_id="new",
+        server_name="reports",
+        profile=None,
+        hermes_home="/tmp/hermes-test",
+        redirect_uri="https://agent.example/mcp/oauth/callback/reports",
+    )
+    redirect = _make_redirect_handler(
+        0, dashboard_flow=stale, server_name="reports"
+    )
+    callback = _make_callback_waiter(
+        0, dashboard_flow=stale, server_name="reports"
+    )
+
+    async def exercise_retry():
+        with shared_dashboard_oauth_flow(active):
+            await redirect("https://idp.example/authorize?state=new-state")
+            active.deliver_callback(
+                code="new-code", state="new-state", error=None
+            )
+            return await callback()
+
+    assert asyncio.run(exercise_retry()) == ("new-code", "new-state")
+    assert active.snapshot()["status"] == "authorization_required"
+    assert stale.snapshot()["status"] == "error"
+
+
 def test_failed_reauth_rollback_preserves_newer_oauth_state(tmp_path, monkeypatch):
     from tools.mcp_oauth import HermesTokenStorage
 

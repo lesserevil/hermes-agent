@@ -599,12 +599,14 @@ class MCPOAuthManager:
             redirect_uri=cfg.get("redirect_uri") or None,
             allow_noninteractive=dashboard_flow is not None,
             dashboard_flow=dashboard_flow,
+            server_name=server_name,
         )
         base_callback_handler = _make_callback_waiter(
             resolved_port,
             timeout=float(cfg.get("timeout", 300)),
             allow_noninteractive=dashboard_flow is not None,
             dashboard_flow=dashboard_flow,
+            server_name=server_name,
         )
 
         async def redirect_handler(authorization_url: str) -> None:

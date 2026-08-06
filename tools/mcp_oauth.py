@@ -700,6 +700,7 @@ def _make_redirect_handler(
     *,
     allow_noninteractive: bool = False,
     dashboard_flow=None,
+    server_name: str | None = None,
 ):
     """Return a redirect handler closure that closes over the given port.
 
@@ -720,7 +721,14 @@ def _make_redirect_handler(
         """
         from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
 
-        active_dashboard_flow = dashboard_flow or get_dashboard_oauth_flow()
+        # Providers survive reconnects and may have captured an expired flow.
+        # Prefer the connector's currently shared retry flow at invocation
+        # time so one-time URLs are never published to the stale object.
+        active_dashboard_flow = (
+            get_dashboard_oauth_flow(server_name)
+            if server_name
+            else get_dashboard_oauth_flow()
+        ) or dashboard_flow
         if active_dashboard_flow is not None:
             await active_dashboard_flow.publish_authorization_url(authorization_url)
             return
@@ -824,6 +832,7 @@ def _make_callback_waiter(
     timeout: float = 300.0,
     allow_noninteractive: bool = False,
     dashboard_flow=None,
+    server_name: str | None = None,
 ):
     """Return a callback waiter bound to a single OAuth flow's port.
 
@@ -846,7 +855,13 @@ def _make_callback_waiter(
     async def _wait() -> tuple[str, str | None]:
         from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
 
-        active_dashboard_flow = dashboard_flow or get_dashboard_oauth_flow()
+        # Resolve the same current retry flow as the redirect handler instead
+        # of waiting on a stale flow captured by a cached OAuth provider.
+        active_dashboard_flow = (
+            get_dashboard_oauth_flow(server_name)
+            if server_name
+            else get_dashboard_oauth_flow()
+        ) or dashboard_flow
         if active_dashboard_flow is not None:
             return await active_dashboard_flow.wait_for_callback(timeout=timeout)
 
@@ -1372,11 +1387,13 @@ def build_oauth_auth(
         resolved_port,
         redirect_uri=cfg.get("redirect_uri") or None,
         dashboard_flow=dashboard_flow,
+        server_name=server_name,
     )
     callback_handler = _make_callback_waiter(
         resolved_port,
         timeout=float(cfg.get("timeout", 300)),
         dashboard_flow=dashboard_flow,
+        server_name=server_name,
     )
 
     return OAuthClientProvider(
