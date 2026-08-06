@@ -637,6 +637,38 @@ class TestRunOnMCPLoopInterrupts:
 # ---------------------------------------------------------------------------
 
 class TestDiscoverAndRegister:
+    def test_dashboard_oauth_uses_extended_outer_connect_timeout(self):
+        """The discovery wrapper must not cancel browser consent early."""
+        from tools.mcp_tool import _discover_and_register_server, MCPServerTask
+
+        server = MCPServerTask("reports")
+        server.session = MagicMock()
+        server._tools = []
+        observed_timeout = []
+
+        async def fake_connect(_name, _config):
+            return server
+
+        async def fake_wait_for(awaitable, timeout):
+            observed_timeout.append(timeout)
+            return await awaitable
+
+        with patch("tools.mcp_tool._connect_server", side_effect=fake_connect), \
+             patch("tools.mcp_tool._mcp_initialize_timeout", return_value=305.0) as resolve, \
+             patch("tools.mcp_tool.asyncio.wait_for", side_effect=fake_wait_for):
+            asyncio.run(
+                _discover_and_register_server(
+                    "reports", {"url": "https://mcp.example", "auth": "oauth"}
+                )
+            )
+
+        resolve.assert_called_once_with(
+            {"url": "https://mcp.example", "auth": "oauth"},
+            server_name="reports",
+            auth_type="oauth",
+        )
+        assert observed_timeout == [305.0]
+
     def test_tools_registered_in_registry(self):
         """_discover_and_register_server registers tools with correct names."""
         from tools.registry import ToolRegistry

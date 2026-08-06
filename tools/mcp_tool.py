@@ -6209,7 +6209,11 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
 
     Returns list of registered tool names.
     """
-    connect_timeout = config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
+    connect_timeout = _mcp_initialize_timeout(
+        config,
+        server_name=name,
+        auth_type=str(config.get("auth") or "").strip().lower() or None,
+    )
     # List-based claim (not a ``nonlocal`` rebind): the claim callback runs
     # inside ``_connect_server`` while this frame is suspended, and appending
     # keeps type narrowing intact for the module's other ``server`` locals.
