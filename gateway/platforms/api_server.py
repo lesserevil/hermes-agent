@@ -4020,6 +4020,49 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.debug("[api_server] session SSE stream error: %s", exc)
         return response
 
+    async def _handle_session_model_lock(self, request: "web.Request") -> "web.Response":
+        """Persist a client-confirmed runtime lock for a session."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        _, err = await self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        runtime_request = self._session_runtime_request_from_body(body)
+        runtime_request["require_model_lock"] = True
+        lock_error = self._runtime_lock_error(runtime_request)
+        if lock_error is not None:
+            return lock_error
+        if not self._persist_session_runtime_lock(session_id, runtime_request):
+            return web.json_response(
+                _openai_error(
+                    "Could not persist the requested session model lock",
+                    code="model_lock_persistence_failed",
+                ),
+                status=500,
+            )
+        requested = runtime_request.get("requested") or {}
+        route = runtime_request.get("route") or {}
+        runtime = self._sanitize_runtime_metadata(
+            runtime={
+                "provider": route.get("provider") or requested.get("provider") or "",
+                "model": route.get("model") or requested.get("model") or "",
+                "route_source": runtime_request.get("route_source") or "raw_request",
+            },
+            requested_runtime=requested,
+            route_source=runtime_request.get("route_source") or "raw_request",
+            model_lock="accepted",
+        )
+        return web.json_response({
+            "object": "hermes.session.model_lock",
+            "session_id": session_id,
+            "runtime": runtime,
+        })
+
     async def _run_nonstream_agent(
         self,
         request: "web.Request",
