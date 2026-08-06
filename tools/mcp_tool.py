@@ -3636,6 +3636,13 @@ _server_breaker_opened_at: Dict[str, float] = {}
 _CIRCUIT_BREAKER_THRESHOLD = 3
 _CIRCUIT_BREAKER_COOLDOWN_SEC = 60.0
 
+# Manual reconnects clear any remembered per-server throttle. The v0.20
+# migration retained that reset in retry_mcp_server(), so keep the small
+# shared state it relies on even though the older tool-call retry helpers are
+# no longer present upstream.
+_server_rate_limit_until: Dict[str, float] = {}
+_server_rate_limit_lock = threading.Lock()
+
 
 def _bump_server_error(server_name: str) -> None:
     """Increment the consecutive-failure count for ``server_name``.
