@@ -3715,6 +3715,11 @@ def retry_mcp_server(server_name: str) -> dict:
         _server_connect_errors.pop(server_name, None)
         _server_error_counts.pop(server_name, None)
         _server_breaker_opened_at.pop(server_name, None)
+        # A failed initial OAuth attempt is intentionally discovery-cooled to
+        # prevent background respawn storms. A user-requested retry must
+        # explicitly bypass that cooldown or register_mcp_servers() silently
+        # filters the connector and no browser flow is ever started.
+        _clear_connect_failure(server_name)
     with _server_rate_limit_lock:
         _server_rate_limit_until.pop(server_name, None)
     if server is None:

@@ -24,11 +24,16 @@ def test_retry_mcp_server_clears_throttle_state(monkeypatch):
         mcp_tool._servers.pop(server_name, None)
     with mcp_tool._server_rate_limit_lock:
         mcp_tool._server_rate_limit_until[server_name] = 123.0
+    with mcp_tool._lock:
+        mcp_tool._server_connect_failures[server_name] = 2
+        mcp_tool._server_connect_retry_after[server_name] = 456.0
 
     status = mcp_tool.retry_mcp_server(server_name)
 
     assert status == {"name": server_name, "status": "configured"}
     assert server_name not in mcp_tool._server_rate_limit_until
+    assert server_name not in mcp_tool._server_connect_failures
+    assert server_name not in mcp_tool._server_connect_retry_after
 
 
 @pytest.mark.no_isolate
