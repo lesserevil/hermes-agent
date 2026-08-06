@@ -925,7 +925,6 @@ def _make_callback_waiter(
             )
             paste_thread.start()
 
-        timeout = 300.0
         poll_interval = 0.5
         elapsed = 0.0
         try:
