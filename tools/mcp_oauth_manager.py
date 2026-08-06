@@ -96,6 +96,8 @@ class _ProviderEntry:
     last_mtime_ns: int = 0
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     pending_401: dict[str, "asyncio.Future[bool]"] = field(default_factory=dict)
+    authorization_url: str = ""
+    browser_lock_held: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -134,11 +136,39 @@ def _make_hermes_provider_class() -> Optional[type]:
             *args: Any,
             server_name: str = "",
             preregistered: bool = False,
+            configured_scope: str = "",
             **kwargs: Any,
         ):
+            self._hermes_configured_scope = configured_scope.strip()
+            if self._hermes_configured_scope and kwargs.get("redirect_handler"):
+                original_redirect_handler = kwargs["redirect_handler"]
+
+                async def scoped_redirect_handler(authorization_url: str) -> None:
+                    """Keep an explicit least-privilege scope after discovery."""
+                    from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+                    parsed = urlsplit(authorization_url)
+                    query = [
+                        (key, value)
+                        for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+                        if key != "scope"
+                    ]
+                    query.append(("scope", self._hermes_configured_scope))
+                    narrowed_url = urlunsplit((
+                        parsed.scheme,
+                        parsed.netloc,
+                        parsed.path,
+                        urlencode(query),
+                        parsed.fragment,
+                    ))
+                    self.context.client_metadata.scope = self._hermes_configured_scope
+                    await original_redirect_handler(narrowed_url)
+
+                kwargs["redirect_handler"] = scoped_redirect_handler
             super().__init__(*args, **kwargs)
             self._hermes_server_name = server_name
             self._hermes_home = ""
+            self.context.lock = asyncio.Lock()
             # When the client_id comes from config.yaml (pre-registered), an
             # invalid_client rejection means the *config* is wrong — deleting
             # client.json would just be re-seeded from config and re-running
@@ -458,6 +488,9 @@ class MCPOAuthManager:
         # event loop's weak-reference bookkeeping cannot GC them mid-run
         # and leave `await pending` waiters hanging forever.
         self._inflight_tasks: set[asyncio.Task] = set()
+        # Every configured OAuth client shares the registered callback port,
+        # so only one interactive browser flow may own it at a time.
+        self._browser_auth_lock = asyncio.Lock()
 
     # -- Provider construction / caching -------------------------------------
 
@@ -602,6 +635,7 @@ class MCPOAuthManager:
         return _HERMES_PROVIDER_CLS(
             server_name=server_name,
             preregistered=bool(cfg.get("client_id")),
+            configured_scope=str(cfg.get("scope") or ""),
             server_url=entry.server_url,
             client_metadata=client_metadata,
             storage=storage,
@@ -609,6 +643,44 @@ class MCPOAuthManager:
             callback_handler=callback_handler,
             timeout=float(cfg.get("timeout", 300)),
         )
+
+    def get_auth_required(
+        self,
+        server_name: str,
+        *,
+        hermes_home: str | Path | None = None,
+    ) -> Optional[dict[str, str]]:
+        """Return the active browser-consent handoff for a connector."""
+        entry = self._entries.get(self._key(server_name, hermes_home))
+        if entry is None or not entry.authorization_url:
+            return None
+        return {
+            "authorization_url": entry.authorization_url,
+            "error": "OAuth authorization requires user consent.",
+        }
+
+    def clear_auth_required(
+        self,
+        server_name: str,
+        *,
+        hermes_home: str | Path | None = None,
+    ) -> None:
+        entry = self._entries.get(self._key(server_name, hermes_home))
+        if entry is not None:
+            entry.authorization_url = ""
+
+    def release_browser_auth(
+        self,
+        server_name: str,
+        *,
+        hermes_home: str | Path | None = None,
+    ) -> None:
+        """Defensively release callback ownership when an auth flow is cancelled."""
+        entry = self._entries.get(self._key(server_name, hermes_home))
+        if entry is not None and entry.browser_lock_held:
+            entry.browser_lock_held = False
+            if self._browser_auth_lock.locked():
+                self._browser_auth_lock.release()
 
     def remove(
         self,

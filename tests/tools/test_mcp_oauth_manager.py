@@ -83,6 +83,26 @@ def test_hermes_provider_subclass_exists():
     assert issubclass(_HERMES_PROVIDER_CLS, OAuthClientProvider)
 
 
+def test_manager_exposes_and_clears_authorization_handoff(tmp_path, monkeypatch):
+    from tools.mcp_oauth_manager import MCPOAuthManager, _ProviderEntry
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    mgr = MCPOAuthManager()
+    mgr._entries[mgr._key("outlook")] = _ProviderEntry(
+        server_url="https://example.test/mcp",
+        oauth_config={},
+        authorization_url="https://login.example.test/oauth?state=abc",
+    )
+
+    assert mgr.get_auth_required("outlook") == {
+        "authorization_url": "https://login.example.test/oauth?state=abc",
+        "error": "OAuth authorization requires user consent.",
+    }
+    mgr.clear_auth_required("outlook")
+    assert mgr.get_auth_required("outlook") is None
+    assert isinstance(mgr._browser_auth_lock, asyncio.Lock)
+
+
 @pytest.mark.asyncio
 async def test_disk_watch_invalidates_on_mtime_change(tmp_path, monkeypatch):
     """When the tokens file mtime changes, provider._initialized flips False.

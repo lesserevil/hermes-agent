@@ -6605,7 +6605,37 @@ def get_mcp_status() -> List[dict]:
         transport = cfg.get("transport", "http") if "url" in cfg else "stdio"
         enabled = _parse_boolish(cfg.get("enabled", True), default=True)
         server = active_servers.get(name)
-        if server and server.session is not None:
+        auth_required = None
+        if cfg.get("auth") == "oauth" or cfg.get("oauth") is not None:
+            try:
+                from tools.mcp_oauth_manager import get_manager
+                auth_required = get_manager().get_auth_required(name)
+            except Exception:  # pragma: no cover - health must remain available
+                logger.debug(
+                    "Could not read OAuth handoff state for '%s'", name,
+                    exc_info=True,
+                )
+
+        if not enabled:
+            result.append({
+                "name": name,
+                "transport": transport,
+                "tools": 0,
+                "connected": False,
+                "disabled": True,
+                "status": "disabled",
+            })
+        elif auth_required:
+            result.append({
+                "name": name,
+                "transport": transport,
+                "tools": 0,
+                "connected": False,
+                "disabled": False,
+                "status": "needs_auth",
+                **auth_required,
+            })
+        elif server and server.session is not None:
             entry = {
                 "name": name,
                 "transport": transport,
@@ -6617,18 +6647,6 @@ def get_mcp_status() -> List[dict]:
             if server._sampling:
                 entry["sampling"] = dict(server._sampling.metrics)
             result.append(entry)
-        elif not enabled:
-            # A server with enabled: false is intentionally not connected — it is
-            # disabled, not failed. Surface that distinction so consumers (banner,
-            # TUI) can render "disabled" rather than an alarming "failed".
-            result.append({
-                "name": name,
-                "transport": transport,
-                "tools": 0,
-                "connected": False,
-                "disabled": True,
-                "status": "disabled",
-            })
         elif name in connecting:
             result.append({
                 "name": name,
