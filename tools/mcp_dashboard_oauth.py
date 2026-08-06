@@ -86,11 +86,17 @@ class DashboardOAuthFlow:
     async def wait_for_callback(self, timeout: float = 300.0) -> tuple[str, str | None]:
         ready = await asyncio.to_thread(self._callback_ready.wait, timeout)
         if not ready:
-            raise TimeoutError("Timed out waiting for MCP OAuth callback")
+            message = "Timed out waiting for MCP OAuth callback"
+            self.mark_error(message)
+            raise TimeoutError(message)
         if self._callback_error:
-            raise RuntimeError(f"OAuth authorization failed: {self._callback_error}")
+            message = f"OAuth authorization failed: {self._callback_error}"
+            self.mark_error(message)
+            raise RuntimeError(message)
         if self._callback is None:
-            raise RuntimeError("OAuth callback did not include an authorization code")
+            message = "OAuth callback did not include an authorization code"
+            self.mark_error(message)
+            raise RuntimeError(message)
         return self._callback
 
     def mark_approved(self) -> None:
@@ -106,6 +112,8 @@ class DashboardOAuthFlow:
                 return
             self.status = "error"
             self.error = error
+            self.authorization_url = None
+            self.expected_state = None
             self._authorization_ready.set()
             self._callback_ready.set()
 
@@ -130,6 +138,8 @@ class DashboardOAuthFlow:
 _current_dashboard_flow: contextvars.ContextVar[DashboardOAuthFlow | None] = (
     contextvars.ContextVar("mcp_dashboard_oauth_flow", default=None)
 )
+_shared_dashboard_flows: dict[str, DashboardOAuthFlow] = {}
+_shared_dashboard_flows_lock = threading.Lock()
 
 
 @contextmanager
@@ -141,5 +151,34 @@ def dashboard_oauth_flow(flow: DashboardOAuthFlow) -> Iterator[None]:
         _current_dashboard_flow.reset(token)
 
 
-def get_dashboard_oauth_flow() -> DashboardOAuthFlow | None:
-    return _current_dashboard_flow.get()
+@contextmanager
+def shared_dashboard_oauth_flow(flow: DashboardOAuthFlow) -> Iterator[None]:
+    """Expose a flow to a pre-existing MCP lifecycle task.
+
+    Connector retries signal a long-lived asyncio task whose ContextVar state
+    predates the HTTP request.  The small keyed registry bridges only that
+    connector while preserving ContextVar isolation for normal dashboard use.
+    """
+    with _shared_dashboard_flows_lock:
+        previous = _shared_dashboard_flows.get(flow.server_name)
+        _shared_dashboard_flows[flow.server_name] = flow
+    try:
+        with dashboard_oauth_flow(flow):
+            yield
+    finally:
+        with _shared_dashboard_flows_lock:
+            if _shared_dashboard_flows.get(flow.server_name) is flow:
+                if previous is None:
+                    _shared_dashboard_flows.pop(flow.server_name, None)
+                else:
+                    _shared_dashboard_flows[flow.server_name] = previous
+
+
+def get_dashboard_oauth_flow(
+    server_name: str | None = None,
+) -> DashboardOAuthFlow | None:
+    flow = _current_dashboard_flow.get()
+    if flow is not None or not server_name:
+        return flow
+    with _shared_dashboard_flows_lock:
+        return _shared_dashboard_flows.get(server_name)

@@ -553,28 +553,51 @@ class MCPOAuthManager:
         )
         storage = HermesTokenStorage(server_name)
 
-        from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
-
-        if (
-            get_dashboard_oauth_flow() is None
-            and not _is_interactive()
-            and not storage.has_cached_tokens()
-        ):
-            raise OAuthNonInteractiveError(
-                "MCP OAuth for "
-                f"'{server_name}': non-interactive environment and no "
-                "cached tokens found. Run `hermes mcp login "
-                f"{server_name}` interactively first to complete initial "
-                "authorization."
-            )
-
-        _configure_callback_port(cfg, storage)
+        _configure_callback_port(cfg, storage, server_name)
         client_metadata = _build_client_metadata(cfg)
         _maybe_preregister_client(storage, cfg, client_metadata)
 
+        from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
+
+        dashboard_flow = get_dashboard_oauth_flow(server_name)
         resolved_port = cfg.get("_resolved_port", 0)
-        redirect_handler = _make_redirect_handler(resolved_port)
-        callback_handler = _make_callback_waiter(resolved_port)
+        base_redirect_handler = _make_redirect_handler(
+            resolved_port,
+            redirect_uri=cfg.get("redirect_uri") or None,
+            allow_noninteractive=dashboard_flow is not None,
+            dashboard_flow=dashboard_flow,
+        )
+        base_callback_handler = _make_callback_waiter(
+            resolved_port,
+            timeout=float(cfg.get("timeout", 300)),
+            allow_noninteractive=dashboard_flow is not None,
+            dashboard_flow=dashboard_flow,
+        )
+
+        async def redirect_handler(authorization_url: str) -> None:
+            await self._browser_auth_lock.acquire()
+            entry.browser_lock_held = True
+            entry.authorization_url = authorization_url
+            try:
+                await base_redirect_handler(authorization_url)
+            except BaseException:
+                entry.browser_lock_held = False
+                self._browser_auth_lock.release()
+                raise
+
+        async def callback_handler() -> tuple[str, str | None]:
+            try:
+                return await base_callback_handler()
+            except BaseException:
+                # The URL contains one-time state + PKCE values and is only
+                # usable while this callback listener is alive. Never leave a
+                # timed-out/cancelled handoff advertised through health.
+                entry.authorization_url = ""
+                raise
+            finally:
+                if entry.browser_lock_held:
+                    entry.browser_lock_held = False
+                    self._browser_auth_lock.release()
 
         return _HERMES_PROVIDER_CLS(
             server_name=server_name,

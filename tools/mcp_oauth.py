@@ -694,7 +694,13 @@ def _make_callback_handler() -> tuple[type, dict]:
 # ---------------------------------------------------------------------------
 
 
-def _make_redirect_handler(port: int, redirect_uri: str | None = None):
+def _make_redirect_handler(
+    port: int,
+    redirect_uri: str | None = None,
+    *,
+    allow_noninteractive: bool = False,
+    dashboard_flow=None,
+):
     """Return a redirect handler closure that closes over the given port.
 
     Using a closure instead of reading the module-level ``_oauth_port`` avoids
@@ -714,9 +720,9 @@ def _make_redirect_handler(port: int, redirect_uri: str | None = None):
         """
         from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
 
-        dashboard_flow = get_dashboard_oauth_flow()
-        if dashboard_flow is not None:
-            await dashboard_flow.publish_authorization_url(authorization_url)
+        active_dashboard_flow = dashboard_flow or get_dashboard_oauth_flow()
+        if active_dashboard_flow is not None:
+            await active_dashboard_flow.publish_authorization_url(authorization_url)
             return
 
         # Fail fast at the authorization boundary in non-interactive contexts
@@ -812,7 +818,13 @@ async def _wait_for_callback() -> tuple[str, str | None]:
     return await _make_callback_waiter(_oauth_port)()
 
 
-def _make_callback_waiter(port: int):
+def _make_callback_waiter(
+    port: int,
+    *,
+    timeout: float = 300.0,
+    allow_noninteractive: bool = False,
+    dashboard_flow=None,
+):
     """Return a callback waiter bound to a single OAuth flow's port.
 
     Closing over the port (instead of reading the module-level
@@ -834,9 +846,9 @@ def _make_callback_waiter(port: int):
     async def _wait() -> tuple[str, str | None]:
         from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
 
-        dashboard_flow = get_dashboard_oauth_flow()
-        if dashboard_flow is not None:
-            return await dashboard_flow.wait_for_callback()
+        active_dashboard_flow = dashboard_flow or get_dashboard_oauth_flow()
+        if active_dashboard_flow is not None:
+            return await active_dashboard_flow.wait_for_callback(timeout=timeout)
 
         # Reject before binding the callback listener in non-interactive
         # contexts. Reaching here means the SDK entered the authorization-code
@@ -1052,6 +1064,7 @@ def remove_oauth_tokens(
 def _configure_callback_port(
     cfg: dict,
     storage: "HermesTokenStorage | None" = None,
+    server_name: str | None = None,
 ) -> int:
     """Pick or validate the OAuth callback port.
 
@@ -1073,7 +1086,7 @@ def _configure_callback_port(
     global _oauth_port
     from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
 
-    dashboard_flow = get_dashboard_oauth_flow()
+    dashboard_flow = get_dashboard_oauth_flow(server_name)
     if dashboard_flow is not None:
         cfg["_resolved_port"] = 0
         cfg["redirect_uri"] = cfg.get("redirect_uri") or dashboard_flow.redirect_uri
@@ -1338,6 +1351,7 @@ def build_oauth_auth(
         cfg, server_name=server_name, server_url=server_url
     )
     storage = HermesTokenStorage(server_name)
+    from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
 
     if not _is_interactive() and not storage.has_cached_tokens():
         raise OAuthNonInteractiveError(
@@ -1348,16 +1362,23 @@ def build_oauth_auth(
             "initial authorization, then cached tokens will be reused."
         )
 
-    _configure_callback_port(cfg, storage)
+    _configure_callback_port(cfg, storage, server_name)
     client_metadata = _build_client_metadata(cfg)
     _maybe_preregister_client(storage, cfg, client_metadata)
 
     # Use closure factories to avoid global state pollution (#44588, #34260).
     resolved_port = cfg.get("_resolved_port", _oauth_port)
+    dashboard_flow = get_dashboard_oauth_flow(server_name)
     redirect_handler = _make_redirect_handler(
-        resolved_port, redirect_uri=cfg.get("redirect_uri") or None
+        resolved_port,
+        redirect_uri=cfg.get("redirect_uri") or None,
+        dashboard_flow=dashboard_flow,
     )
-    callback_handler = _make_callback_waiter(resolved_port)
+    callback_handler = _make_callback_waiter(
+        resolved_port,
+        timeout=float(cfg.get("timeout", 300)),
+        dashboard_flow=dashboard_flow,
+    )
 
     return OAuthClientProvider(
         server_url=server_url,

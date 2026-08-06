@@ -392,6 +392,47 @@ def _is_safe_workdir_char(ch: str) -> bool:
     if ord(ch) < 32 or ord(ch) == 127:
         return False
     return ch.isalnum() or ch in _WORKDIR_SAFE_ASCII_CHARS
+_WORKDIR_SAFE_RE = re.compile(r'^[A-Za-z0-9/\\:_\-.~ +@=,]+$')
+_SHELL_CONTROL_TOKENS = {";", "&&", "||", "|", "&", "(", ")"}
+_SHELL_COMMANDS = {"bash", "dash", "fish", "ksh", "sh", "zsh"}
+
+
+def _contains_recursive_hermes_oneshot(command: str) -> bool:
+    """Return whether an agent terminal command launches another Hermes agent."""
+
+    def _tokenize(value: str) -> list[str]:
+        lexer = shlex.shlex(value, posix=True, punctuation_chars=";&|()")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        return list(lexer)
+
+    def _inspect(value: str, depth: int = 0) -> bool:
+        try:
+            tokens = _tokenize(value)
+        except ValueError:
+            return bool(re.search(
+                r"(?<![A-Za-z0-9_.-])(?:[^\s;&|()]+/)?hermes\s+-z(?:\s|$)",
+                value,
+            ))
+        for index, token in enumerate(tokens):
+            executable = os.path.basename(token)
+            if executable == "hermes":
+                for argument in tokens[index + 1:]:
+                    if argument in _SHELL_CONTROL_TOKENS:
+                        break
+                    if argument == "-z":
+                        return True
+            if (
+                depth == 0
+                and executable in _SHELL_COMMANDS
+                and index + 2 < len(tokens)
+                and tokens[index + 1] in {"-c", "-lc"}
+                and _inspect(tokens[index + 2], depth + 1)
+            ):
+                return True
+        return False
+
+    return _inspect(command)
 
 
 def _validate_workdir(workdir: str) -> str | None:
@@ -2286,6 +2327,17 @@ def terminal_tool(
                 "output": "",
                 "exit_code": -1,
                 "error": f"Invalid command: expected string, got {type(command).__name__}",
+                "status": "error",
+            }, ensure_ascii=False)
+        if _contains_recursive_hermes_oneshot(command):
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": (
+                    "Blocked recursive Hermes self-launch. An agent must call the "
+                    "required tool directly or use delegate_task; it cannot run "
+                    "`hermes -z` through its own terminal."
+                ),
                 "status": "error",
             }, ensure_ascii=False)
 

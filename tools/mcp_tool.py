@@ -363,6 +363,17 @@ def _jittered(seconds: float) -> float:
 _DEFAULT_KEEPALIVE_INTERVAL = 180  # seconds between liveness pings
 _MIN_KEEPALIVE_INTERVAL = 5        # clamp floor for configured intervals
 
+
+def _mcp_initialize_timeout(config: dict, *, server_name: str, auth_type: str | None) -> float:
+    """Extend only dashboard-mediated OAuth handshakes for browser consent."""
+    connect_timeout = float(config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT))
+    if auth_type != "oauth":
+        return connect_timeout
+    from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
+    if get_dashboard_oauth_flow(server_name) is None:
+        return connect_timeout
+    return max(connect_timeout, float((config.get("oauth") or {}).get("timeout", 300)) + 5)
+
 # Final shutdown gives pending MCP-loop tasks one bounded cancellation cycle
 # before closing their owning loop. Cooperative parked/reconnect waiters finish
 # immediately; cancellation-resistant tasks must not hang process exit.
@@ -2767,6 +2778,9 @@ class MCPServerTask:
         if not any(key.lower() == "mcp-protocol-version" for key in headers):
             headers["mcp-protocol-version"] = LATEST_PROTOCOL_VERSION
         connect_timeout = config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
+        initialize_timeout = _mcp_initialize_timeout(
+            config, server_name=self.name, auth_type=self._auth_type,
+        )
         ssl_verify = config.get("ssl_verify", True)
         client_cert = _resolve_client_cert(self.name, config)
 
@@ -2865,7 +2879,7 @@ class MCPServerTask:
                         # connection but never answers ``initialize`` parks this
                         # coroutine forever on the background loop.
                         self.initialize_result = await asyncio.wait_for(
-                            session.initialize(), timeout=float(connect_timeout)
+                            session.initialize(), timeout=initialize_timeout
                         )
                         self.session = session
                         await self._discover_tools()
@@ -2928,7 +2942,7 @@ class MCPServerTask:
                         async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
                             # Bound the handshake (#59349) — see stdio path.
                             self.initialize_result = await asyncio.wait_for(
-                                session.initialize(), timeout=float(connect_timeout)
+                                session.initialize(), timeout=initialize_timeout
                             )
                             self.session = session
                             await self._discover_tools()
@@ -2966,7 +2980,7 @@ class MCPServerTask:
                     async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
                         # Bound the handshake (#59349) — see stdio path.
                         self.initialize_result = await asyncio.wait_for(
-                            session.initialize(), timeout=float(connect_timeout)
+                            session.initialize(), timeout=initialize_timeout
                         )
                         self.session = session
                         await self._discover_tools()
@@ -3681,6 +3695,32 @@ def reconnect_mcp_server(server_name: str) -> bool:
     if server is None:
         return False
     return _signal_reconnect(server)
+
+
+def retry_mcp_server(server_name: str) -> dict:
+    """Retry one configured MCP transport without interrupting other sessions."""
+    configured = _load_mcp_config()
+    if server_name not in configured:
+        raise KeyError(server_name)
+    config = configured[server_name]
+    with _lock:
+        server = _servers.get(server_name)
+        _server_connect_errors.pop(server_name, None)
+        _server_error_counts.pop(server_name, None)
+        _server_breaker_opened_at.pop(server_name, None)
+    with _server_rate_limit_lock:
+        _server_rate_limit_until.pop(server_name, None)
+    if server is None:
+        register_mcp_servers({server_name: config})
+    else:
+        old_session = getattr(server, "session", None)
+        if not _signal_reconnect(server):
+            raise RuntimeError(f"MCP server '{server_name}' has no reconnect mechanism")
+        _wait_for_server_session_ready(
+            server, old_session=old_session,
+            timeout=max(1.0, min(float(config.get("connect_timeout", 15) or 15), 30.0)),
+        )
+    return next(item for item in get_mcp_status() if item.get("name") == server_name)
 
 
 def _wait_for_server_session_ready(
