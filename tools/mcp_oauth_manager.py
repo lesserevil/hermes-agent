@@ -631,7 +631,13 @@ class MCPOAuthManager:
 
         async def callback_handler() -> tuple[str, str | None]:
             try:
-                return await base_callback_handler()
+                callback = await base_callback_handler()
+                # The one-time browser handoff has been consumed.  Clear it
+                # before token exchange and transport discovery continue so
+                # health reports the actual connection state instead of
+                # indefinitely prioritising a stale ``needs_auth`` marker.
+                entry.authorization_url = ""
+                return callback
             except BaseException:
                 # The URL contains one-time state + PKCE values and is only
                 # usable while this callback listener is alive. Never leave a

@@ -132,6 +132,18 @@ async def test_dashboard_oauth_does_not_claim_shared_loopback_lock(tmp_path, mon
     assert flow.snapshot()["status"] == "authorization_required"
     assert not manager._browser_auth_lock.locked()
     assert not manager._entries[manager._key("outlook")].browser_lock_held
+    assert manager.get_auth_required("outlook") is not None
+
+    flow.deliver_callback(
+        code="authorization-code",
+        state="dashboard-state",
+        error=None,
+    )
+    assert await provider.context.callback_handler() == (
+        "authorization-code",
+        "dashboard-state",
+    )
+    assert manager.get_auth_required("outlook") is None
 
 
 @pytest.mark.asyncio
