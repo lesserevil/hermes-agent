@@ -609,20 +609,25 @@ class MCPOAuthManager:
         cfg = dict(entry.oauth_config or {})
         storage = HermesTokenStorage(server_name)
 
-        _configure_callback_port(cfg, storage)
+        _configure_callback_port(cfg, storage, server_name)
         client_metadata = _build_client_metadata(cfg)
         _maybe_preregister_client(storage, cfg, client_metadata)
 
+        from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
+
+        dashboard_flow = get_dashboard_oauth_flow(server_name)
         resolved_port = cfg.get("_resolved_port", 0)
         base_redirect_handler = _make_redirect_handler(
             resolved_port,
             redirect_uri=cfg.get("redirect_uri") or None,
-            allow_noninteractive=True,
+            allow_noninteractive=dashboard_flow is not None,
+            dashboard_flow=dashboard_flow,
         )
         base_callback_handler = _make_callback_waiter(
             resolved_port,
             timeout=float(cfg.get("timeout", 300)),
-            allow_noninteractive=True,
+            allow_noninteractive=dashboard_flow is not None,
+            dashboard_flow=dashboard_flow,
         )
 
         async def redirect_handler(authorization_url: str) -> None:

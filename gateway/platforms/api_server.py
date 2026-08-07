@@ -54,6 +54,7 @@ import sqlite3
 import sys
 import time
 import uuid
+from urllib.parse import urlparse
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -1048,6 +1049,10 @@ class APIServerAdapter(BasePlatformAdapter):
         # Active run agent/task references for stop support
         self._active_run_agents: Dict[str, Any] = {}
         self._active_run_tasks: Dict[str, "asyncio.Task"] = {}
+        # Connector-scoped MCP retries may continue while a browser completes
+        # OAuth. Keep their executor futures alive without blocking the API.
+        self._mcp_retry_futures: Dict[str, "asyncio.Future"] = {}
+        self._mcp_oauth_flows: Dict[str, Any] = {}
         # Stop is cooperative: the executor thread may outlive the HTTP request.
         self._stopping_run_ids: set[str] = set()
         # Pollable run status for dashboards and external control-plane UIs.
@@ -1548,6 +1553,9 @@ class APIServerAdapter(BasePlatformAdapter):
         routes: List[tuple] = [
             ("GET", "/health", self._handle_health),
             ("GET", "/health/detailed", self._handle_health_detailed),
+            ("POST", "/api/mcp/servers/{name}/retry", self._handle_mcp_retry),
+            ("GET", "/api/mcp/oauth/callback", self._handle_mcp_oauth_callback),
+            ("GET", "/api/mcp/oauth/callback/{name}", self._handle_mcp_oauth_callback),
             ("GET", "/v1/health", self._handle_health),
             ("GET", "/v1/models", self._handle_models),
             ("GET", "/v1/capabilities", self._handle_capabilities),
@@ -2014,6 +2022,219 @@ class APIServerAdapter(BasePlatformAdapter):
             "pid": os.getpid(),
         })
 
+    async def _handle_mcp_retry(self, request: "web.Request") -> "web.Response":
+        """POST /api/mcp/servers/{name}/retry — reconnect one MCP transport."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        name = str(request.match_info.get("name") or "").strip()
+        if not name:
+            return web.json_response({"error": "MCP server name is required"}, status=400)
+
+        from tools.mcp_tool import get_mcp_status, retry_mcp_server
+
+        callback_url = ""
+        if request.can_read_body:
+            try:
+                body = await request.json()
+            except (json.JSONDecodeError, ValueError):
+                return web.json_response({"error": "Invalid JSON body"}, status=400)
+            callback_url = str((body or {}).get("callback_url") or "").strip()
+        if callback_url:
+            parsed_callback = urlparse(callback_url)
+            if (
+                parsed_callback.scheme not in {"http", "https"}
+                or not parsed_callback.netloc
+                or parsed_callback.query
+                or parsed_callback.fragment
+            ):
+                return web.json_response(
+                    {"error": "callback_url must be an absolute HTTP(S) URL without a query or fragment"},
+                    status=400,
+                )
+
+        def _connector_status() -> dict:
+            return next(
+                (item for item in get_mcp_status() if item.get("name") == name),
+                {},
+            )
+
+        previous_auth_url = str(_connector_status().get("authorization_url") or "")
+        future = self._mcp_retry_futures.get(name)
+        if future is not None and not future.done():
+            connector = _connector_status()
+            if connector.get("authorization_url"):
+                return web.json_response(
+                    {"status": "authorization_required", "connector": connector},
+                    status=202,
+                )
+            return web.json_response(
+                {"status": "retrying", "connector": connector}, status=202
+            )
+        if future is None or future.done():
+            flow = None
+            if callback_url:
+                from hermes_constants import get_hermes_home
+                from tools.mcp_dashboard_oauth import DashboardOAuthFlow
+
+                flow = DashboardOAuthFlow(
+                    flow_id=uuid.uuid4().hex,
+                    server_name=name,
+                    profile=None,
+                    hermes_home=str(get_hermes_home().expanduser().resolve(strict=False)),
+                    redirect_uri=callback_url,
+                    reconnect_live=True,
+                )
+                self._mcp_oauth_flows[name] = flow
+
+            def _retry_one_connector():
+                if flow is None:
+                    return retry_mcp_server(name)
+                from tools.mcp_dashboard_oauth import shared_dashboard_oauth_flow
+                from tools.mcp_oauth import force_interactive_oauth
+                from tools.mcp_oauth_manager import get_manager
+
+                try:
+                    with force_interactive_oauth(), shared_dashboard_oauth_flow(flow):
+                        # Rebuild only this connector's cached OAuth provider;
+                        # it still contains the old loopback redirect URI.
+                        get_manager().remove(name)
+                        connector = retry_mcp_server(name)
+                        if connector.get("connected"):
+                            flow.mark_approved()
+                            return connector
+
+                        # retry_mcp_server() only waits for the short transport
+                        # readiness window. Browser OAuth continues inside the
+                        # MCP lifecycle task, so keep this shared flow and the
+                        # per-connector retry future alive until that task
+                        # connects or the advertised callback window ends.
+                        # Otherwise a second button press creates a new flow,
+                        # overwrites _mcp_oauth_flows[name], and the first
+                        # browser callback is rejected as expired.
+                        deadline = time.monotonic() + 305.0
+                        while time.monotonic() < deadline:
+                            flow_state = flow.snapshot()
+                            if flow_state["status"] == "error":
+                                raise RuntimeError(
+                                    flow_state["error"] or "MCP OAuth flow failed"
+                                )
+                            connector = _connector_status()
+                            if connector.get("connected"):
+                                flow.mark_approved()
+                                return connector
+                            time.sleep(0.1)
+
+                        message = "Timed out waiting for MCP OAuth connection"
+                        flow.mark_error(message)
+                        raise TimeoutError(message)
+                except Exception as exc:
+                    flow.mark_error(str(exc))
+                    raise
+                finally:
+                    flow.mark_worker_done()
+
+            future = asyncio.get_running_loop().run_in_executor(
+                None, _retry_one_connector
+            )
+            self._mcp_retry_futures[name] = future
+
+            def _consume_retry_result(done: "asyncio.Future") -> None:
+                self._mcp_retry_futures.pop(name, None)
+                try:
+                    done.exception()
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+            future.add_done_callback(_consume_retry_result)
+
+        # Normal reconnects usually finish in under a second. OAuth retries
+        # keep running while the user is in the browser, so return as soon as
+        # Hermes publishes a NEW authorization URL rather than waiting for the
+        # callback window to expire.
+        for _ in range(100):
+            if future.done():
+                try:
+                    connector = future.result()
+                except KeyError:
+                    return web.json_response(
+                        {"error": f"Unknown MCP server: {name}"}, status=404
+                    )
+                except Exception as exc:
+                    logger.warning("MCP server '%s' retry failed: %s", name, exc)
+                    return web.json_response(
+                        {"error": _redact_api_error_text(exc, limit=500)}, status=502
+                    )
+                return web.json_response(
+                    {"status": "retried", "connector": connector}
+                )
+
+            connector = _connector_status()
+            authorization_url = str(connector.get("authorization_url") or "")
+            if authorization_url and authorization_url != previous_auth_url:
+                return web.json_response(
+                    {"status": "authorization_required", "connector": connector},
+                    status=202,
+                )
+            await asyncio.sleep(0.1)
+
+        return web.json_response(
+            {"status": "retrying", "connector": _connector_status()}, status=202
+        )
+
+    async def _handle_mcp_oauth_callback(self, request: "web.Request") -> "web.Response":
+        """Receive an authenticated server-to-server forwarded OAuth callback."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        name = str(request.match_info.get("name") or "").strip()
+        state = request.query.get("state")
+        candidates = (
+            [self._mcp_oauth_flows.get(name)]
+            if name else list(self._mcp_oauth_flows.values())
+        )
+        flow = next(
+            (
+                candidate for candidate in candidates
+                if candidate is not None
+                and candidate.status == "authorization_required"
+                and candidate.expected_state is not None
+                and state is not None
+                and hmac.compare_digest(candidate.expected_state, state)
+            ),
+            None,
+        )
+        if flow is None:
+            named_flow = self._mcp_oauth_flows.get(name) if name else None
+            if named_flow is not None and named_flow.status == "authorization_required":
+                return web.Response(
+                    text="<h1>OAuth callback rejected</h1><p>The callback state was invalid.</p>",
+                    content_type="text/html",
+                    status=400,
+                )
+            return web.Response(
+                text="<h1>OAuth flow expired</h1><p>Return to LinusBot and retry.</p>",
+                content_type="text/html",
+                status=404,
+            )
+        try:
+            flow.deliver_callback(
+                code=request.query.get("code"),
+                state=state,
+                error=request.query.get("error"),
+            )
+        except ValueError:
+            return web.Response(
+                text="<h1>OAuth callback rejected</h1><p>The callback was invalid or already used.</p>",
+                content_type="text/html",
+                status=400,
+            )
+        return web.Response(
+            text="<h1>Authorization received</h1><p>You can close this tab and return to LinusBot.</p>",
+            content_type="text/html",
+        )
+
     async def _handle_models(self, request: "web.Request") -> "web.Response":
         """GET /v1/models — list hermes-agent and any configured model_routes aliases.
 
@@ -2104,6 +2325,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "tool_progress_events": True,
                 "approval_events": True,
                 "direct_tool_call": True,
+                "mcp_connector_retry": True,
                 "session_resources": True,
                 "session_chat": True,
                 "session_chat_streaming": True,
@@ -2121,6 +2343,10 @@ class APIServerAdapter(BasePlatformAdapter):
             "endpoints": {
                 "health": {"method": "GET", "path": "/health"},
                 "health_detailed": {"method": "GET", "path": "/health/detailed"},
+                "mcp_connector_retry": {
+                    "method": "POST",
+                    "path": "/api/mcp/servers/{name}/retry",
+                },
                 "models": {"method": "GET", "path": "/v1/models"},
                 "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
                 "responses": {"method": "POST", "path": "/v1/responses"},
@@ -2750,6 +2976,51 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.debug("[api_server] session SSE stream error: %s", exc)
         return response
 
+    async def _run_nonstream_agent(
+        self,
+        request: "web.Request",
+        **agent_kwargs,
+    ):
+        """Run one non-streaming agent and stop it when its HTTP client leaves."""
+        agent_ref = [None]
+        agent_task = asyncio.ensure_future(self._run_agent(
+            **agent_kwargs,
+            agent_ref=agent_ref,
+        ))
+
+        def _interrupt(reason: str) -> None:
+            agent = agent_ref[0]
+            if agent is not None:
+                try:
+                    agent.interrupt(reason)
+                except Exception:
+                    logger.debug(
+                        "Could not interrupt disconnected API agent",
+                        exc_info=True,
+                    )
+
+        try:
+            while not agent_task.done():
+                await asyncio.wait({agent_task}, timeout=0.25)
+                transport = request.transport
+                if transport is not None and transport.is_closing():
+                    _interrupt("API client disconnected")
+                    agent_task.cancel()
+                    try:
+                        await agent_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                    raise ConnectionResetError("API client disconnected")
+            return await agent_task
+        except asyncio.CancelledError:
+            _interrupt("API request cancelled")
+            agent_task.cancel()
+            try:
+                await agent_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            raise
+
     @_admit_api_agent_request
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
@@ -2981,7 +3252,8 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
         async def _compute_completion():
-            return await self._run_agent(
+            return await self._run_nonstream_agent(
+                request,
                 user_message=user_message,
                 conversation_history=history,
                 ephemeral_system_prompt=system_prompt,
@@ -2995,6 +3267,8 @@ class APIServerAdapter(BasePlatformAdapter):
             fp = _make_request_fingerprint(body, keys=["model", "messages", "tools", "tool_choice", "stream"])
             try:
                 result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
+            except ConnectionResetError:
+                raise
             except Exception as e:
                 logger.error("Error running agent for chat completions: %s", e, exc_info=True)
                 return web.json_response(
@@ -3004,6 +3278,8 @@ class APIServerAdapter(BasePlatformAdapter):
         else:
             try:
                 result, usage = await _compute_completion()
+            except ConnectionResetError:
+                raise
             except Exception as e:
                 logger.error("Error running agent for chat completions: %s", e, exc_info=True)
                 return web.json_response(

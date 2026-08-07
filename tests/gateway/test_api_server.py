@@ -643,6 +643,15 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app["api_server_adapter"] = adapter
     app.router.add_get("/health", adapter._handle_health)
     app.router.add_get("/health/detailed", adapter._handle_health_detailed)
+    app.router.add_post(
+        "/api/mcp/servers/{name}/retry", adapter._handle_mcp_retry
+    )
+    app.router.add_get(
+        "/api/mcp/oauth/callback", adapter._handle_mcp_oauth_callback
+    )
+    app.router.add_get(
+        "/api/mcp/oauth/callback/{name}", adapter._handle_mcp_oauth_callback
+    )
     app.router.add_get("/v1/health", adapter._handle_health)
     app.router.add_get("/v1/models", adapter._handle_models)
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
@@ -996,6 +1005,11 @@ class TestCapabilitiesEndpoint:
             assert data["features"]["run_status"] is True
             assert data["features"]["run_events_sse"] is True
             assert data["features"]["direct_tool_call"] is True
+            assert data["features"]["mcp_connector_retry"] is True
+            assert data["endpoints"]["mcp_connector_retry"] == {
+                "method": "POST",
+                "path": "/api/mcp/servers/{name}/retry",
+            }
             assert data["features"]["session_continuity_header"] == "X-Hermes-Session-Id"
             assert data["endpoints"]["run_status"]["path"] == "/v1/runs/{run_id}"
             assert data["endpoints"]["skills"] == {"method": "GET", "path": "/v1/skills"}
@@ -1019,6 +1033,230 @@ class TestCapabilitiesEndpoint:
             assert authed.status == 200
             data = await authed.json()
             assert data["auth"]["required"] is True
+
+
+class TestMCPRetryEndpoint:
+    @pytest.mark.asyncio
+    async def test_retries_one_connector_without_gateway_restart(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        connector = {
+            "name": "maas_outlook",
+            "status": "connected",
+            "connected": True,
+            "tools": 12,
+        }
+        with patch("tools.mcp_tool.retry_mcp_server", return_value=connector) as retry:
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/api/mcp/servers/maas_outlook/retry",
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+                data = await resp.json()
+
+        assert resp.status == 200
+        assert data == {"status": "retried", "connector": connector}
+        retry.assert_called_once_with("maas_outlook")
+
+    @pytest.mark.asyncio
+    async def test_retry_requires_auth(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/api/mcp/servers/maas_outlook/retry")
+        assert resp.status == 401
+
+    @pytest.mark.asyncio
+    async def test_retry_rejects_unknown_connector(self, adapter):
+        app = _create_app(adapter)
+        with patch("tools.mcp_tool.retry_mcp_server", side_effect=KeyError("missing")):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post("/api/mcp/servers/missing/retry")
+        assert resp.status == 404
+
+    @pytest.mark.asyncio
+    async def test_retry_returns_fresh_oauth_url_while_connector_keeps_running(
+        self, adapter
+    ):
+        app = _create_app(adapter)
+        old = {
+            "name": "maas_outlook",
+            "status": "needs_auth",
+            "connected": False,
+            "authorization_url": "https://login.test/old",
+        }
+        fresh = {**old, "authorization_url": "https://login.test/fresh"}
+        calls = 0
+
+        def statuses():
+            nonlocal calls
+            calls += 1
+            return [old if calls < 3 else fresh]
+
+        def slow_retry(_name):
+            time.sleep(0.5)
+            return fresh
+
+        with patch("tools.mcp_tool.get_mcp_status", side_effect=statuses), patch(
+            "tools.mcp_tool.retry_mcp_server", side_effect=slow_retry
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                started = time.monotonic()
+                resp = await cli.post("/api/mcp/servers/maas_outlook/retry")
+                elapsed = time.monotonic() - started
+                data = await resp.json()
+
+        assert resp.status == 202
+        assert elapsed < 0.5
+        assert data["status"] == "authorization_required"
+        assert data["connector"]["authorization_url"] == "https://login.test/fresh"
+
+    @pytest.mark.asyncio
+    async def test_retry_reuses_inflight_oauth_url(self, adapter):
+        app = _create_app(adapter)
+        connector = {
+            "name": "maas_outlook",
+            "status": "needs_auth",
+            "connected": False,
+            "authorization_url": "https://login.test/current",
+        }
+        pending = asyncio.get_running_loop().create_future()
+        adapter._mcp_retry_futures["maas_outlook"] = pending
+        try:
+            with patch("tools.mcp_tool.get_mcp_status", return_value=[connector]):
+                async with TestClient(TestServer(app)) as cli:
+                    resp = await cli.post("/api/mcp/servers/maas_outlook/retry")
+                    data = await resp.json()
+        finally:
+            pending.cancel()
+
+        assert resp.status == 202
+        assert data == {"status": "authorization_required", "connector": connector}
+
+    @pytest.mark.asyncio
+    async def test_dashboard_retry_stays_inflight_until_connector_connects(
+        self, adapter
+    ):
+        app = _create_app(adapter)
+        connector = {
+            "name": "maas_outlook",
+            "status": "needs_auth",
+            "connected": False,
+            "authorization_url": "",
+        }
+
+        def retry(_name):
+            flow = adapter._mcp_oauth_flows["maas_outlook"]
+            asyncio.run(
+                flow.publish_authorization_url(
+                    "https://login.test/authorize?state=fresh-state"
+                )
+            )
+            connector["authorization_url"] = flow.authorization_url
+            return dict(connector)
+
+        with patch("tools.mcp_tool.retry_mcp_server", side_effect=retry), patch(
+            "tools.mcp_tool.get_mcp_status", side_effect=lambda: [dict(connector)]
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/api/mcp/servers/maas_outlook/retry",
+                    headers={"Authorization": "Bearer sk-secret"},
+                    json={"callback_url": "http://127.0.0.1:8765/callback"},
+                )
+                data = await resp.json()
+
+                future = adapter._mcp_retry_futures["maas_outlook"]
+                assert future.done() is False
+                connector.update(
+                    status="connected",
+                    connected=True,
+                    authorization_url="",
+                )
+                await asyncio.wait_for(asyncio.shield(future), timeout=1.0)
+
+        assert resp.status == 202
+        assert data["connector"]["authorization_url"].endswith(
+            "state=fresh-state"
+        )
+        assert adapter._mcp_oauth_flows["maas_outlook"].status == "approved"
+
+    @pytest.mark.asyncio
+    async def test_https_callback_delivers_code_to_active_connector_flow(
+        self, auth_adapter
+    ):
+        from tools.mcp_dashboard_oauth import DashboardOAuthFlow
+
+        app = _create_app(auth_adapter)
+        flow = DashboardOAuthFlow(
+            flow_id="flow-1",
+            server_name="maas_outlook",
+            profile=None,
+            hermes_home="/tmp/hermes",
+            redirect_uri="https://linusbot.test/api/mcp/oauth/callback/maas_outlook",
+        )
+        await flow.publish_authorization_url(
+            "https://login.test/authorize?state=expected"
+        )
+        auth_adapter._mcp_oauth_flows["maas_outlook"] = flow
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get(
+                "/api/mcp/oauth/callback/maas_outlook?code=abc&state=expected",
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+
+        assert resp.status == 200
+        assert await flow.wait_for_callback(timeout=0.1) == ("abc", "expected")
+
+    @pytest.mark.asyncio
+    async def test_https_callback_rejects_wrong_state(self, auth_adapter):
+        from tools.mcp_dashboard_oauth import DashboardOAuthFlow
+
+        app = _create_app(auth_adapter)
+        flow = DashboardOAuthFlow(
+            flow_id="flow-2",
+            server_name="maas_outlook",
+            profile=None,
+            hermes_home="/tmp/hermes",
+            redirect_uri="https://linusbot.test/api/mcp/oauth/callback/maas_outlook",
+        )
+        await flow.publish_authorization_url(
+            "https://login.test/authorize?state=expected"
+        )
+        auth_adapter._mcp_oauth_flows["maas_outlook"] = flow
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get(
+                "/api/mcp/oauth/callback/maas_outlook?code=abc&state=wrong",
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+
+        assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_loopback_relay_resolves_flow_by_oauth_state(self, auth_adapter):
+        from tools.mcp_dashboard_oauth import DashboardOAuthFlow
+
+        app = _create_app(auth_adapter)
+        flow = DashboardOAuthFlow(
+            flow_id="flow-loopback",
+            server_name="maas_outlook",
+            profile=None,
+            hermes_home="/tmp/hermes",
+            redirect_uri="http://127.0.0.1:8765/callback",
+        )
+        await flow.publish_authorization_url(
+            "https://login.test/authorize?state=loopback-state"
+        )
+        auth_adapter._mcp_oauth_flows["maas_outlook"] = flow
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get(
+                "/api/mcp/oauth/callback?code=abc&state=loopback-state",
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+
+        assert resp.status == 200
+        assert await flow.wait_for_callback(timeout=0.1) == ("abc", "loopback-state")
 
 
 # ---------------------------------------------------------------------------
@@ -1200,6 +1438,54 @@ class TestToolsetsEndpoint:
 
 
 class TestChatCompletionsEndpoint:
+    @pytest.mark.asyncio
+    async def test_nonstream_disconnect_interrupts_and_cancels_agent(self, adapter):
+        started = asyncio.Event()
+        agent = MagicMock()
+
+        async def _slow_agent(**kwargs):
+            kwargs["agent_ref"][0] = agent
+            started.set()
+            await asyncio.Event().wait()
+
+        request = MagicMock()
+        request.transport.is_closing.return_value = True
+        with patch.object(adapter, "_run_agent", side_effect=_slow_agent):
+            with pytest.raises(ConnectionResetError, match="disconnected"):
+                await adapter._run_nonstream_agent(
+                    request,
+                    user_message="hello",
+                    conversation_history=[],
+                )
+
+        assert started.is_set()
+        agent.interrupt.assert_called_once_with("API client disconnected")
+
+    @pytest.mark.asyncio
+    async def test_nonstream_handler_cancellation_interrupts_agent(self, adapter):
+        started = asyncio.Event()
+        agent = MagicMock()
+
+        async def _slow_agent(**kwargs):
+            kwargs["agent_ref"][0] = agent
+            started.set()
+            await asyncio.Event().wait()
+
+        request = MagicMock()
+        request.transport.is_closing.return_value = False
+        with patch.object(adapter, "_run_agent", side_effect=_slow_agent):
+            task = asyncio.create_task(adapter._run_nonstream_agent(
+                request,
+                user_message="hello",
+                conversation_history=[],
+            ))
+            await started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        agent.interrupt.assert_called_once_with("API request cancelled")
+
     @pytest.mark.asyncio
     async def test_invalid_json_returns_400(self, adapter):
         app = _create_app(adapter)

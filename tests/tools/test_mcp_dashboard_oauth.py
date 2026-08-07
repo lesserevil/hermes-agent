@@ -132,6 +132,32 @@ def test_dashboard_flow_cannot_resurrect_after_terminal_error():
     assert flow.authorization_url is None
 
 
+def test_dashboard_callback_timeout_expires_url_and_state():
+    from tools.mcp_dashboard_oauth import DashboardOAuthFlow
+
+    flow = DashboardOAuthFlow(
+        flow_id="flow-callback-timeout",
+        server_name="reports",
+        profile=None,
+        hermes_home="/tmp/hermes-test",
+        redirect_uri="https://agent.example/mcp/oauth/callback/reports",
+    )
+    asyncio.run(
+        flow.publish_authorization_url(
+            "https://idp.example/authorize?state=expired-state"
+        )
+    )
+
+    with pytest.raises(TimeoutError, match="Timed out waiting"):
+        asyncio.run(flow.wait_for_callback(timeout=0.01))
+
+    assert flow.status == "error"
+    assert flow.authorization_url is None
+    assert flow.expected_state is None
+    with pytest.raises(ValueError, match="already received|state mismatch"):
+        flow.deliver_callback(code="late", state="expired-state", error=None)
+
+
 def test_dashboard_context_overrides_redirect_and_handlers():
     from tools.mcp_dashboard_oauth import (
         DashboardOAuthFlow,
@@ -207,6 +233,81 @@ def test_manager_build_allows_dashboard_flow_without_tty(tmp_path, monkeypatch):
     assert str(provider.context.client_metadata.redirect_uris[0]) == flow.redirect_uri
 
 
+def test_dashboard_oauth_initialize_outlives_callback_window():
+    from tools import mcp_tool
+    from tools.mcp_dashboard_oauth import DashboardOAuthFlow, shared_dashboard_oauth_flow
+
+    flow = DashboardOAuthFlow(
+        flow_id="flow-timeout",
+        server_name="reports",
+        profile=None,
+        hermes_home="/tmp/hermes-test",
+        redirect_uri="https://agent.example/api/mcp/oauth/callback/reports",
+    )
+    config = {
+        "connect_timeout": 60,
+        "oauth": {"timeout": 300},
+    }
+
+    with shared_dashboard_oauth_flow(flow):
+        timeout = mcp_tool._mcp_initialize_timeout(
+            config,
+            server_name="reports",
+            auth_type="oauth",
+        )
+
+    assert timeout > config["oauth"]["timeout"]
+
+
+def test_cached_oauth_initialize_keeps_normal_connect_timeout():
+    from tools import mcp_tool
+
+    assert mcp_tool._mcp_initialize_timeout(
+        {"connect_timeout": 17, "oauth": {"timeout": 300}},
+        server_name="reports",
+        auth_type="oauth",
+    ) == 17
+
+
+def test_dashboard_oauth_discovery_uses_callback_aware_timeout(monkeypatch):
+    from tools import mcp_tool
+    from tools.mcp_dashboard_oauth import DashboardOAuthFlow, shared_dashboard_oauth_flow
+
+    observed = {}
+
+    async def fake_wait_for(coro, timeout):
+        observed["timeout"] = timeout
+        return await coro
+
+    async def fake_connect_server(name, config):
+        raise RuntimeError("stop after timeout capture")
+
+    flow = DashboardOAuthFlow(
+        flow_id="flow-discovery-timeout",
+        server_name="reports",
+        profile=None,
+        hermes_home="/tmp/hermes-test",
+        redirect_uri="https://agent.example/api/mcp/oauth/callback/reports",
+    )
+    monkeypatch.setattr(mcp_tool.asyncio, "wait_for", fake_wait_for)
+    monkeypatch.setattr(mcp_tool, "_connect_server", fake_connect_server)
+
+    with shared_dashboard_oauth_flow(flow):
+        with pytest.raises(RuntimeError, match="timeout capture"):
+            asyncio.run(
+                mcp_tool._discover_and_register_server(
+                    "reports",
+                    {
+                        "auth": "oauth",
+                        "connect_timeout": 60,
+                        "oauth": {"timeout": 300},
+                    },
+                )
+            )
+
+    assert observed["timeout"] > 300
+
+
 def test_manager_evict_preserves_persisted_oauth_state(tmp_path, monkeypatch):
     from tools.mcp_oauth import HermesTokenStorage
     from tools.mcp_oauth_manager import MCPOAuthManager, _ProviderEntry
@@ -273,6 +374,79 @@ def test_reconnect_mcp_server_keeps_manager_entry_until_live_task_rebuilds(
 
     assert mcp_tool.reconnect_mcp_server("reports") is True
     assert manager._key("reports", tmp_path) in manager._entries
+
+
+def test_retry_mcp_server_registers_only_requested_missing_server(monkeypatch):
+    from tools import mcp_tool
+
+    registered = []
+    monkeypatch.setattr(
+        mcp_tool,
+        "_load_mcp_config",
+        lambda: {
+            "reports": {"url": "https://reports.example/mcp"},
+            "calendar": {"url": "https://calendar.example/mcp"},
+        },
+    )
+    monkeypatch.setattr(mcp_tool, "_servers", {})
+    monkeypatch.setattr(
+        mcp_tool, "register_mcp_servers", lambda servers: registered.append(servers)
+    )
+    monkeypatch.setattr(
+        mcp_tool,
+        "get_mcp_status",
+        lambda: [{"name": "reports", "status": "connected", "connected": True}],
+    )
+
+    result = mcp_tool.retry_mcp_server("reports")
+
+    assert registered == [{"reports": {"url": "https://reports.example/mcp"}}]
+    assert result["connected"] is True
+
+
+def test_retry_mcp_server_signals_only_requested_live_server(monkeypatch):
+    from tools import mcp_tool
+
+    class Event:
+        def __init__(self):
+            self.called = False
+
+        def set(self):
+            self.called = True
+
+    class Server:
+        session = None
+
+        def __init__(self):
+            self._reconnect_event = Event()
+
+    reports = Server()
+    calendar = Server()
+    monkeypatch.setattr(
+        mcp_tool,
+        "_load_mcp_config",
+        lambda: {
+            "reports": {"url": "https://reports.example/mcp"},
+            "calendar": {"url": "https://calendar.example/mcp"},
+        },
+    )
+    monkeypatch.setattr(
+        mcp_tool, "_servers", {"reports": reports, "calendar": calendar}
+    )
+    monkeypatch.setattr(mcp_tool, "_mcp_loop", None)
+    monkeypatch.setattr(
+        mcp_tool, "_wait_for_server_session_ready", lambda *args, **kwargs: True
+    )
+    monkeypatch.setattr(
+        mcp_tool,
+        "get_mcp_status",
+        lambda: [{"name": "reports", "status": "reconnecting", "connected": False}],
+    )
+
+    mcp_tool.retry_mcp_server("reports")
+
+    assert reports._reconnect_event.called is True
+    assert calendar._reconnect_event.called is False
 
 
 def test_failed_reauth_rollback_preserves_newer_oauth_state(tmp_path, monkeypatch):

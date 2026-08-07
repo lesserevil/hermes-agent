@@ -1,5 +1,7 @@
 """Regression tests for sudo detection and sudo password handling."""
 
+import json
+
 import tools.terminal_tool as terminal_tool
 
 
@@ -28,6 +30,39 @@ def test_terminal_schema_advertises_persistent_env_state():
     assert "exported environment variables persist between calls" in description
     assert "activate a virtualenv" in description
     assert "do not re-source the same environment before every command" in description
+
+
+def test_terminal_blocks_recursive_hermes_oneshot_before_environment_setup(monkeypatch):
+    def fail_if_called():
+        raise AssertionError("terminal environment must not be created")
+
+    monkeypatch.setattr(terminal_tool, "_get_env_config", fail_if_called)
+
+    result = json.loads(terminal_tool.terminal_tool(
+        command=(
+            "hermes -z 'Call the MCP tool mcp__maas_outlook__"
+            "outlook_list_messages and return JSON'"
+        )
+    ))
+
+    assert result["status"] == "error"
+    assert result["exit_code"] == -1
+    assert "recursive Hermes self-launch" in result["error"]
+
+
+def test_recursive_hermes_guard_handles_compound_and_shell_wrapped_commands():
+    assert terminal_tool._contains_recursive_hermes_oneshot(
+        "echo preparing && /usr/local/bin/hermes -z 'do the same task'"
+    )
+    assert terminal_tool._contains_recursive_hermes_oneshot(
+        """bash -lc "hermes -z 'do the same task'" """
+    )
+    assert not terminal_tool._contains_recursive_hermes_oneshot(
+        "printf '%s\\n' 'hermes -z is documented here'"
+    )
+    assert not terminal_tool._contains_recursive_hermes_oneshot(
+        "hermes tools list"
+    )
 
 
 def test_printf_literal_sudo_does_not_trigger_rewrite(monkeypatch):
