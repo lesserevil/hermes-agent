@@ -3712,6 +3712,15 @@ def retry_mcp_server(server_name: str) -> dict:
     config = configured[server_name]
     with _lock:
         server = _servers.get(server_name)
+        # An explicit dashboard retry must be eager. A connector whose tools
+        # were restored lazily from the schema cache has no lifecycle task to
+        # signal, and register_mcp_servers() intentionally skips it. Evict the
+        # dormant cache registration so OAuth can actually start now.
+        lazy_tool_names = _lazy_server_tool_names.pop(server_name, [])
+        _lazy_server_configs.pop(server_name, None)
+        _lazy_server_fingerprints.pop(server_name, None)
+        if server is None:
+            _server_connecting.discard(server_name)
         _server_connect_errors.pop(server_name, None)
         _server_error_counts.pop(server_name, None)
         _server_breaker_opened_at.pop(server_name, None)
@@ -3720,6 +3729,12 @@ def retry_mcp_server(server_name: str) -> dict:
         # explicitly bypass that cooldown or register_mcp_servers() silently
         # filters the connector and no browser flow is ever started.
         _clear_connect_failure(server_name)
+    if lazy_tool_names:
+        from tools.registry import registry
+
+        for tool_name in lazy_tool_names:
+            registry.deregister(tool_name)
+            _forget_mcp_tool_server(tool_name)
     with _server_rate_limit_lock:
         _server_rate_limit_until.pop(server_name, None)
     if server is None:
