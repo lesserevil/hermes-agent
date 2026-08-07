@@ -104,6 +104,37 @@ def test_manager_exposes_and_clears_authorization_handoff(tmp_path, monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_dashboard_oauth_does_not_claim_shared_loopback_lock(tmp_path, monkeypatch):
+    """Dashboard flows route callbacks by state and may run concurrently."""
+    from tools.mcp_dashboard_oauth import DashboardOAuthFlow, dashboard_oauth_flow
+    from tools.mcp_oauth_manager import MCPOAuthManager
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    flow = DashboardOAuthFlow(
+        flow_id="dashboard-flow",
+        server_name="outlook",
+        profile=None,
+        hermes_home=str(tmp_path),
+        redirect_uri="http://127.0.0.1:8765/callback",
+    )
+    manager = MCPOAuthManager()
+
+    with dashboard_oauth_flow(flow):
+        provider = manager.get_or_build_provider(
+            "outlook",
+            "https://mcp.example.test/mcp",
+            {"redirect_port": 8765},
+        )
+        await provider.context.redirect_handler(
+            "https://login.example.test/authorize?state=dashboard-state"
+        )
+
+    assert flow.snapshot()["status"] == "authorization_required"
+    assert not manager._browser_auth_lock.locked()
+    assert not manager._entries[manager._key("outlook")].browser_lock_held
+
+
+@pytest.mark.asyncio
 async def test_disk_watch_invalidates_on_mtime_change(tmp_path, monkeypatch):
     """When the tokens file mtime changes, provider._initialized flips False.
 

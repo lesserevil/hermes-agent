@@ -593,6 +593,13 @@ class MCPOAuthManager:
         from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
 
         dashboard_flow = get_dashboard_oauth_flow(server_name)
+        # Dashboard callbacks are multiplexed by connector + OAuth state by
+        # the LinusBot callback bridge.  They do not bind the loopback port
+        # themselves, so serialising them behind the process-wide browser
+        # lock only lets one connector authorize at a time.  Keep the lock
+        # for the CLI/local-listener path, where it still protects the shared
+        # callback port.
+        uses_dashboard_bridge = dashboard_flow is not None
         resolved_port = cfg.get("_resolved_port", 0)
         base_redirect_handler = _make_redirect_handler(
             resolved_port,
@@ -610,14 +617,16 @@ class MCPOAuthManager:
         )
 
         async def redirect_handler(authorization_url: str) -> None:
-            await self._browser_auth_lock.acquire()
-            entry.browser_lock_held = True
+            if not uses_dashboard_bridge:
+                await self._browser_auth_lock.acquire()
+                entry.browser_lock_held = True
             entry.authorization_url = authorization_url
             try:
                 await base_redirect_handler(authorization_url)
             except BaseException:
-                entry.browser_lock_held = False
-                self._browser_auth_lock.release()
+                if entry.browser_lock_held:
+                    entry.browser_lock_held = False
+                    self._browser_auth_lock.release()
                 raise
 
         async def callback_handler() -> tuple[str, str | None]:
