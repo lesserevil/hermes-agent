@@ -178,7 +178,13 @@ def get_dashboard_oauth_flow(
     server_name: str | None = None,
 ) -> DashboardOAuthFlow | None:
     flow = _current_dashboard_flow.get()
-    if flow is not None or not server_name:
+    if not server_name:
         return flow
+
+    # A long-lived MCP lifecycle task can retain the ContextVar from the
+    # dashboard flow under which it was first created.  On a later retry that
+    # task-local value is stale; the keyed shared registry is the authoritative
+    # handoff for this connector while the new retry worker is active.
     with _shared_dashboard_flows_lock:
-        return _shared_dashboard_flows.get(server_name)
+        shared = _shared_dashboard_flows.get(server_name)
+    return shared or flow

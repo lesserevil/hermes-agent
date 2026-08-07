@@ -139,6 +139,36 @@ def test_oauth_handlers_replace_stale_captured_flow_with_active_retry():
     assert stale.snapshot()["status"] == "error"
 
 
+def test_connector_lookup_prefers_shared_retry_over_stale_task_context():
+    from tools import mcp_dashboard_oauth as dashboard
+
+    stale = dashboard.DashboardOAuthFlow(
+        flow_id="old-context",
+        server_name="reports",
+        profile=None,
+        hermes_home="/tmp/hermes-test",
+        redirect_uri="https://agent.example/mcp/oauth/callback/reports",
+    )
+    stale.mark_error("expired")
+    active = dashboard.DashboardOAuthFlow(
+        flow_id="current-retry",
+        server_name="reports",
+        profile=None,
+        hermes_home="/tmp/hermes-test",
+        redirect_uri="https://agent.example/mcp/oauth/callback/reports",
+    )
+
+    with dashboard.dashboard_oauth_flow(stale):
+        with dashboard._shared_dashboard_flows_lock:
+            dashboard._shared_dashboard_flows["reports"] = active
+        try:
+            assert dashboard.get_dashboard_oauth_flow("reports") is active
+            assert dashboard.get_dashboard_oauth_flow() is stale
+        finally:
+            with dashboard._shared_dashboard_flows_lock:
+                dashboard._shared_dashboard_flows.pop("reports", None)
+
+
 def test_failed_reauth_rollback_preserves_newer_oauth_state(tmp_path, monkeypatch):
     from tools.mcp_oauth import HermesTokenStorage
 
