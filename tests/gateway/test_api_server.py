@@ -312,6 +312,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
     app.router.add_get("/v1/skills", adapter._handle_skills)
     app.router.add_get("/v1/toolsets", adapter._handle_toolsets)
+    app.router.add_post("/v1/tools/call", adapter._handle_direct_tool_call)
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
     app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
@@ -871,16 +872,54 @@ class TestCapabilitiesEndpoint:
             assert data["features"]["run_status"] is True
             assert data["features"]["run_events_sse"] is True
             assert data["features"]["model_options"] is True
+            assert data["features"]["direct_tool_call"] is True
             assert data["features"]["session_continuity_header"] == "X-Hermes-Session-Id"
             assert data["endpoints"]["run_status"]["path"] == "/v1/runs/{run_id}"
             assert data["endpoints"]["model_options"] == {"method": "GET", "path": "/api/model/options"}
             assert data["endpoints"]["skills"] == {"method": "GET", "path": "/v1/skills"}
             assert data["endpoints"]["toolsets"] == {"method": "GET", "path": "/v1/toolsets"}
+            assert data["endpoints"]["direct_tool_call"] == {
+                "method": "POST",
+                "path": "/v1/tools/call",
+            }
 
 
 # ---------------------------------------------------------------------------
 # /v1/skills and /v1/toolsets endpoints
 # ---------------------------------------------------------------------------
+
+
+class TestDirectToolCallEndpoint:
+    @pytest.mark.asyncio
+    async def test_dispatches_allowlisted_tool_with_serialized_result(
+        self, adapter, monkeypatch
+    ):
+        tool_name = "mcp__maas_outlook__outlook_list_messages"
+        tool_result = '{"success":true,"data":{"value":[]}}'
+        serialized = json.dumps({
+            "result": tool_result,
+            "structuredContent": {"result": tool_result},
+        })
+        monkeypatch.setenv("API_SERVER_DIRECT_TOOL_ALLOWLIST", tool_name)
+
+        with patch(
+            "tools.registry.registry.dispatch",
+            return_value=serialized,
+        ) as dispatch:
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(
+                    "/v1/tools/call",
+                    json={"name": tool_name, "arguments": {"limit": 5}},
+                )
+                data = await response.json()
+
+        assert response.status == 200
+        assert data == {
+            "result": tool_result,
+            "structuredContent": {"result": tool_result},
+        }
+        dispatch.assert_called_once_with(tool_name, {"limit": 5})
 
 
 class TestSkillsEndpoint:
@@ -2856,4 +2895,3 @@ class TestCreateAgentModelRecovery:
         )
         adapter._create_agent(session_id="another-session", gateway_session_key="stable-chan-1")
         assert captured[1]["model"] == "minimax/minimax-m3"
-

@@ -1952,6 +1952,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/capabilities", self._handle_capabilities),
             ("GET", "/v1/skills", self._handle_skills),
             ("GET", "/v1/toolsets", self._handle_toolsets),
+            ("POST", "/v1/tools/call", self._handle_direct_tool_call),
             ("GET", "/api/sessions", self._handle_list_sessions),
             ("POST", "/api/sessions", self._handle_create_session),
             ("GET", "/api/sessions/{session_id}", self._handle_get_session),
@@ -3263,6 +3264,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
+                "direct_tool_call": {"method": "POST", "path": "/v1/tools/call"},
                 "sessions": {"method": "GET", "path": "/api/sessions"},
                 "session_create": {"method": "POST", "path": "/api/sessions"},
                 "session": {"method": "GET", "path": "/api/sessions/{session_id}"},
@@ -3275,6 +3277,43 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_model_lock": {"method": "POST", "path": "/api/sessions/{session_id}/model"},
             },
         })
+
+    async def _handle_direct_tool_call(self, request: "web.Request") -> "web.Response":
+        """Dispatch an operator-allowlisted tool without model mediation."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        allowed = {
+            item.strip()
+            for item in os.getenv("API_SERVER_DIRECT_TOOL_ALLOWLIST", "").split(",")
+            if item.strip()
+        }
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid JSON body"}, status=400)
+        name = str(payload.get("name") or "").strip() if isinstance(payload, dict) else ""
+        arguments = payload.get("arguments") if isinstance(payload, dict) else None
+        if name not in allowed:
+            return web.json_response({"error": "tool is not allowlisted"}, status=403)
+        if not isinstance(arguments, dict):
+            return web.json_response({"error": "arguments must be an object"}, status=400)
+
+        from tools.registry import registry
+
+        try:
+            result = await asyncio.to_thread(registry.dispatch, name, arguments)
+        except Exception as exc:
+            logger.warning("Direct tool call '%s' failed: %s", name, exc)
+            return web.json_response({"error": str(exc)[:500]}, status=502)
+        # The registry serializes the MCP CallToolResult envelope. Preserve
+        # that envelope without adding another ``result`` nesting level;
+        # LinusBot's deterministic scheduled skills parse its inner result.
+        try:
+            payload = json.loads(result)
+        except (json.JSONDecodeError, TypeError):
+            payload = {"result": str(result)}
+        return web.json_response(payload)
 
     async def _handle_skills(self, request: "web.Request") -> "web.Response":
         """GET /v1/skills — list installed skills visible to the API-server agent.
