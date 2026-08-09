@@ -417,6 +417,46 @@ def _make_hermes_provider_class() -> Optional[type]:
                     self._hermes_server_name, exc,
                 )
 
+        async def _handle_refresh_response(self, response: Any) -> bool:
+            """Retain the current refresh token unless the server rotates it.
+
+            RFC 6749 allows a successful refresh response to omit
+            ``refresh_token``. In that case the existing refresh token remains
+            the credential for the next refresh. The MCP SDK replaces
+            ``current_tokens`` with the response wholesale, which otherwise
+            drops that credential and forces browser authorization after the
+            newly issued access token expires.
+
+            Delegate unsuccessful responses to the SDK unchanged. If the
+            server supplies a rotated refresh token, that new value also wins
+            unchanged.
+            """
+            current_tokens = self.context.current_tokens
+            previous_refresh_token = (
+                current_tokens.refresh_token if current_tokens is not None else None
+            )
+
+            refreshed = await super()._handle_refresh_response(response)
+            refreshed_tokens = self.context.current_tokens
+            if (
+                refreshed
+                and previous_refresh_token
+                and refreshed_tokens is not None
+                and not refreshed_tokens.refresh_token
+            ):
+                refreshed_tokens = refreshed_tokens.model_copy(
+                    update={"refresh_token": previous_refresh_token}
+                )
+                self.context.current_tokens = refreshed_tokens
+                await self.context.storage.set_tokens(refreshed_tokens)
+                logger.debug(
+                    "MCP OAuth '%s': refresh response omitted refresh_token; "
+                    "retained the existing token",
+                    self._hermes_server_name,
+                )
+
+            return refreshed
+
         async def async_auth_flow(self, request):  # type: ignore[override]
             # Pre-flow hook: ask the manager to refresh from disk if needed.
             # Any failure here is non-fatal — we just log and proceed with

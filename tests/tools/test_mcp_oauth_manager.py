@@ -83,6 +83,77 @@ def test_hermes_provider_subclass_exists():
     assert issubclass(_HERMES_PROVIDER_CLS, OAuthClientProvider)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("response_refresh_token", "expected_refresh_token"),
+    [
+        (None, "existing-refresh"),
+        ("rotated-refresh", "rotated-refresh"),
+    ],
+)
+async def test_refresh_response_retains_or_rotates_refresh_token(
+    tmp_path,
+    monkeypatch,
+    response_refresh_token,
+    expected_refresh_token,
+):
+    """A refresh response may omit a new refresh token under RFC 6749."""
+    import httpx
+    from mcp.shared.auth import OAuthClientMetadata, OAuthToken
+    from pydantic import AnyUrl
+
+    from tools.mcp_oauth import HermesTokenStorage
+    from tools.mcp_oauth_manager import _HERMES_PROVIDER_CLS, reset_manager_for_tests
+
+    assert _HERMES_PROVIDER_CLS is not None
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    reset_manager_for_tests()
+
+    storage = HermesTokenStorage("srv")
+    existing_tokens = OAuthToken(
+        access_token="old-access",
+        token_type="Bearer",
+        expires_in=0,
+        refresh_token="existing-refresh",
+    )
+    await storage.set_tokens(existing_tokens)
+
+    provider = _HERMES_PROVIDER_CLS(
+        server_name="srv",
+        server_url="https://example.com/mcp",
+        client_metadata=OAuthClientMetadata(
+            redirect_uris=[AnyUrl("http://127.0.0.1:12345/callback")],
+            client_name="Hermes Agent",
+        ),
+        storage=storage,
+        redirect_handler=None,
+        callback_handler=None,
+    )
+    provider.context.current_tokens = existing_tokens
+
+    response_payload = {
+        "access_token": "new-access",
+        "token_type": "Bearer",
+        "expires_in": 3600,
+    }
+    if response_refresh_token is not None:
+        response_payload["refresh_token"] = response_refresh_token
+    request = httpx.Request("POST", "https://login.example.com/oauth/token")
+    response = httpx.Response(200, json=response_payload, request=request)
+
+    assert await provider._handle_refresh_response(response) is True
+    assert provider.context.current_tokens.access_token == "new-access"
+    assert (
+        provider.context.current_tokens.refresh_token == expected_refresh_token
+    )
+
+    persisted_tokens = await storage.get_tokens()
+    assert persisted_tokens is not None
+    assert persisted_tokens.access_token == "new-access"
+    assert persisted_tokens.refresh_token == expected_refresh_token
+
+
 def test_manager_exposes_and_clears_authorization_handoff(tmp_path, monkeypatch):
     from tools.mcp_oauth_manager import MCPOAuthManager, _ProviderEntry
 
