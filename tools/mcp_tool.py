@@ -3710,8 +3710,21 @@ def retry_mcp_server(server_name: str) -> dict:
     if server_name not in configured:
         raise KeyError(server_name)
     config = configured[server_name]
+    stale_server = None
     with _lock:
         server = _servers.get(server_name)
+        if server is not None:
+            task = getattr(server, "_task", None)
+            if task is None or task.done():
+                # A failed first-use OAuth attempt can leave a server object in
+                # the registry after its lifecycle task has exited. Signalling
+                # that dead object's reconnect event is a no-op, so the API
+                # remains in ``retrying`` until its five-minute timeout without
+                # ever publishing an authorization URL. Evict it and let the
+                # explicit retry create a fresh eager lifecycle task.
+                stale_server = _servers.pop(server_name, None)
+                server = None
+                _server_connecting.discard(server_name)
         # An explicit dashboard retry must be eager. A connector whose tools
         # were restored lazily from the schema cache has no lifecycle task to
         # signal, and register_mcp_servers() intentionally skips it. Evict the
@@ -3735,6 +3748,16 @@ def retry_mcp_server(server_name: str) -> dict:
         for tool_name in lazy_tool_names:
             registry.deregister(tool_name)
             _forget_mcp_tool_server(tool_name)
+    if stale_server is not None:
+        try:
+            stale_server._deregister_tools()
+        except Exception as exc:
+            logger.debug(
+                "MCP server '%s': stale retry cleanup failed: %s",
+                server_name,
+                exc,
+            )
+        stale_server.session = None
     with _server_rate_limit_lock:
         _server_rate_limit_until.pop(server_name, None)
     if server is None:
@@ -3743,10 +3766,29 @@ def retry_mcp_server(server_name: str) -> dict:
         old_session = getattr(server, "session", None)
         if not _signal_reconnect(server):
             raise RuntimeError(f"MCP server '{server_name}' has no reconnect mechanism")
-        _wait_for_server_session_ready(
+        reconnected = _wait_for_server_session_ready(
             server, old_session=old_session,
             timeout=max(1.0, min(float(config.get("connect_timeout", 15) or 15), 30.0)),
         )
+        task = getattr(server, "_task", None)
+        if not reconnected and (task is None or task.done()):
+            # The lifecycle can exit while a reconnect is in flight. Replace
+            # that newly-dead object immediately instead of making the user
+            # press Re-authenticate a second time.
+            with _lock:
+                if _servers.get(server_name) is server:
+                    _servers.pop(server_name, None)
+                _server_connecting.discard(server_name)
+            try:
+                server._deregister_tools()
+            except Exception as exc:
+                logger.debug(
+                    "MCP server '%s': failed reconnect cleanup failed: %s",
+                    server_name,
+                    exc,
+                )
+            server.session = None
+            register_mcp_servers({server_name: config})
     return next(item for item in get_mcp_status() if item.get("name") == server_name)
 
 

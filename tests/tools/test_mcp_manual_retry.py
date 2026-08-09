@@ -1,5 +1,7 @@
 """Regression tests for dashboard-triggered MCP reconnects."""
 
+from types import SimpleNamespace
+
 import pytest
 
 
@@ -69,6 +71,41 @@ def test_retry_mcp_server_forces_dormant_lazy_connector_eager(monkeypatch):
     assert server_name not in mcp_tool._lazy_server_configs
     assert server_name not in mcp_tool._lazy_server_fingerprints
     assert server_name not in mcp_tool._lazy_server_tool_names
+
+
+@pytest.mark.no_isolate
+def test_retry_mcp_server_replaces_dead_cached_server(monkeypatch):
+    from tools import mcp_tool
+
+    server_name = "dashboard-oauth-dead"
+    config = {"url": "https://mcp.example.test", "auth": "oauth"}
+    observed = []
+    dead_server = SimpleNamespace(
+        _task=SimpleNamespace(done=lambda: True),
+        session=None,
+        _registered_tool_names=[],
+        _deregister_tools=lambda: observed.append("deregistered"),
+    )
+    monkeypatch.setattr(mcp_tool, "_load_mcp_config", lambda: {server_name: config})
+    monkeypatch.setattr(
+        mcp_tool, "register_mcp_servers", lambda servers: observed.append(servers)
+    )
+    monkeypatch.setattr(
+        mcp_tool,
+        "get_mcp_status",
+        lambda: [{"name": server_name, "status": "configured"}],
+    )
+
+    with mcp_tool._lock:
+        mcp_tool._servers[server_name] = dead_server
+        mcp_tool._server_connecting.add(server_name)
+
+    status = mcp_tool.retry_mcp_server(server_name)
+
+    assert status == {"name": server_name, "status": "configured"}
+    assert observed == ["deregistered", {server_name: config}]
+    assert server_name not in mcp_tool._server_connecting
+    assert mcp_tool._servers.get(server_name) is not dead_server
 
 
 @pytest.mark.no_isolate
